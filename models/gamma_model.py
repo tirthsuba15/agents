@@ -55,6 +55,27 @@ MODEL_PATH  = Path(__file__).parent / "gamma_model.pkl"
 # Default cross-sectional universe used when running the acceptance test
 DEFAULT_UNIVERSE = ["NVDA", "AAPL", "MSFT", "SPY"]
 
+# Sector map for per-sector model routing (#29)
+SECTOR_MAP: dict[str, str] = {}
+for _sector, _tickers in {
+    "tech": [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "ADBE",
+        "ORCL", "CRM", "AMD", "NFLX", "CSCO", "QCOM", "AMAT", "KLAC",
+        "LRCX", "SNPS", "CDNS", "PANW", "INTU", "AVGO", "XLK", "SMH",
+    ],
+    "healthcare": [
+        "UNH", "JNJ", "LLY", "ABT", "TMO", "SYK", "ISRG", "VRTX", "REGN",
+        "GILD", "AMGN", "ZTS", "BSX", "BDX", "DHR", "CI", "MRK", "ABBV",
+        "PFE", "XLV",
+    ],
+    "financials": [
+        "JPM", "BAC", "WFC", "GS", "MS", "BLK", "AXP", "C", "SPGI", "MCO",
+        "CB", "AON", "CME", "PGR", "XLF", "HYG",
+    ],
+}.items():
+    for _t in _tickers:
+        SECTOR_MAP[_t] = _sector
+
 
 # ---------------------------------------------------------------------------
 # Time helper (local copy — avoids importing private _tte)
@@ -289,23 +310,37 @@ def compute_composite_scores(feature_rows: list[dict]) -> list[dict]:
 # XGBoost path (future — needs historical options snapshots)
 # ---------------------------------------------------------------------------
 
-def _try_load_xgb_model():
+def _try_load_xgb_model(target: str | None = None):
     """
-    Load trained XGBoost model if it beats random (dir_acc > 0.50).
-    Returns (model, model_type, feature_names, normaliser) or all-None tuple.
+    Load trained XGBoost model if it beats random (dir_acc > 0.51).
+    Tries sector-specific model first (#29), falls back to full model.
+    Returns (model, model_type, feature_names, normaliser, dir_acc) or all-None tuple.
     """
-    if MODEL_PATH.exists():
-        import joblib
-        payload = joblib.load(MODEL_PATH)
-        if payload.get("dir_acc", 0) < 0.51:
-            return None, None, None, None
+    import joblib
+
+    candidates = []
+    if target:
+        sector = SECTOR_MAP.get(target, "other")
+        sector_path = MODEL_PATH.parent / f"gamma_model_{sector}.pkl"
+        if sector_path.exists():
+            candidates.append(sector_path)
+    candidates.append(MODEL_PATH)
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        payload = joblib.load(path)
+        dir_acc = payload.get("dir_acc", 0)
+        if dir_acc < 0.51:
+            continue
         return (
             payload.get("model"),
             payload.get("model_type", "regressor"),
             payload.get("feature_names", FEATURE_NAMES),
             payload.get("normaliser", 1.0),
+            dir_acc,
         )
-    return None, None, None, None
+    return None, None, None, None, 0.0
 
 
 def train_gamma_model(historical_data: list[dict]) -> None:
@@ -387,23 +422,30 @@ def predict_gamma(target: str, universe: list[str] | None = None) -> dict:
     if target_row is None:
         raise RuntimeError(f"{target} options chain unavailable")
 
-    # Try XGBoost first; fall back to formula
-    xgb, model_type, feat_names, normaliser = _try_load_xgb_model()
+    # Always compute formula score (needed for blend #31)
+    scored = compute_composite_scores(feature_rows)
+    formula_result    = next(s for s in scored if s["symbol"] == target)
+    formula_direction = formula_result["direction"]
+
+    # Try sector-specific XGBoost, fall back to full model (#29)
+    xgb, model_type, feat_names, normaliser, dir_acc = _try_load_xgb_model(target)
     if xgb:
         vec = np.array([[target_row.get(f, 0.0) for f in feat_names]])
         if model_type == "classifier":
-            proba      = float(xgb.predict_proba(vec)[0][1])
-            direction  = round((proba - 0.5) * 2, 4)
+            proba       = float(xgb.predict_proba(vec)[0][1])
+            xgb_direction = round((proba - 0.5) * 2, 4)
         else:
-            raw        = float(xgb.predict(vec)[0])
-            direction  = round(float(np.clip(raw / normaliser, -1, 1)), 4)
+            raw           = float(xgb.predict(vec)[0])
+            xgb_direction = round(float(np.clip(raw / normaliser, -1, 1)), 4)
+
+        # Blend XGBoost + formula (#31)
+        blended   = 0.5 * xgb_direction + 0.5 * formula_direction
+        direction  = round(float(np.clip(blended, -1, 1)), 4)
         conviction = round(abs(direction), 4)
-        method     = f"xgboost_{model_type}"
+        method     = "xgboost_blend_v1"
     else:
-        scored = compute_composite_scores(feature_rows)
-        result = next(s for s in scored if s["symbol"] == target)
-        direction  = result["direction"]
-        conviction = result["conviction"]
+        direction  = formula_direction
+        conviction = formula_result["conviction"]
         method     = "weighted_formula"
 
     return {

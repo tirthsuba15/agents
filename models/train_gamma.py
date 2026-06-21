@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore")
 MODEL_PATH    = Path(__file__).parent / "gamma_model.pkl"
 FEATURE_NAMES = [
     "iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level",
-    "mom4w", "rsi14", "hpr52",
+    "mom4w", "rsi14", "hpr52", "gex_x_vix",
 ]
 
 START = "2019-01-01"
@@ -77,6 +77,31 @@ UNIVERSE = [
     "SMH", "HYG", "EFA", "EEM",
 ]
 UNIVERSE = list(dict.fromkeys(UNIVERSE))
+
+# Sector buckets for per-sector models (#29)
+SECTORS = {
+    "tech": [
+        "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "ADBE",
+        "ORCL", "CRM", "AMD", "NFLX", "CSCO", "QCOM", "AMAT", "KLAC",
+        "LRCX", "SNPS", "CDNS", "PANW", "INTU", "AVGO", "XLK", "SMH",
+    ],
+    "healthcare": [
+        "UNH", "JNJ", "LLY", "ABT", "TMO", "SYK", "ISRG", "VRTX", "REGN",
+        "GILD", "AMGN", "ZTS", "BSX", "BDX", "DHR", "CI", "MRK", "ABBV",
+        "PFE", "XLV",
+    ],
+    "financials": [
+        "JPM", "BAC", "WFC", "GS", "MS", "BLK", "AXP", "C", "SPGI", "MCO",
+        "CB", "AON", "CME", "PGR", "XLF", "HYG",
+    ],
+}
+_SECTOR_TICKER_SET = {t for tickers in SECTORS.values() for t in tickers}
+
+def _get_sector(symbol: str) -> str:
+    for sector, tickers in SECTORS.items():
+        if symbol in tickers:
+            return sector
+    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +147,10 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
     sma20 = close.rolling(20).mean()
     gex_w = np.sign(close - sma20).resample("W-FRI").last()
 
+    # gex_x_vix interaction: trend direction × short-term vol (#30)
+    gex_x_vix_d = np.sign(close - sma20) * hv(close, 10)
+    gex_x_vix_w = gex_x_vix_d.resample("W-FRI").last()
+
     # Price-factor features (weekly)
     close_w  = close.resample("W-FRI").last()
     mom4w_w  = close_w.pct_change(4)
@@ -136,6 +165,7 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
         "mom4w":           mom4w_w,
         "rsi14":           rsi14_w,
         "hpr52":           hpr52_w,
+        "gex_x_vix":       gex_x_vix_w,
     })
 
     # Align VIX on the same weekly index
@@ -147,11 +177,12 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
 
 def build_labels(close_daily: pd.Series, spy_close_daily: pd.Series) -> pd.Series:
     """
-    Binary label: 1 if stock outperformed SPY next week, 0 otherwise.
-    Shift(-1) aligns the NEXT week's return to the CURRENT week's features.
+    Binary label: 1 if stock outperformed SPY over next 4 weeks, 0 otherwise.
+    Shift(-4) aligns the NEXT 4-week return to the CURRENT week's features (#27).
+    4-week returns are smoother than 1-week, making them easier to predict.
     """
-    stock_w = close_daily.resample("W-FRI").last().pct_change().shift(-1)
-    spy_w   = spy_close_daily.resample("W-FRI").last().pct_change().shift(-1)
+    stock_w = close_daily.resample("W-FRI").last().pct_change(4).shift(-4)
+    spy_w   = spy_close_daily.resample("W-FRI").last().pct_change(4).shift(-4)
     return ((stock_w - spy_w) > 0).astype(int).dropna()
 
 
@@ -263,11 +294,47 @@ def train() -> None:
         "feature_names": FEATURE_NAMES,
         "model_type":    "classifier",
         "dir_acc":       acc,
-        "trained_on":    "price_proxies_v2",
+        "trained_on":    "price_proxies_v3",
         "universe_size": df["symbol"].nunique(),
         "train_date":    datetime.date.today().isoformat(),
     }, MODEL_PATH)
     print(f"\n  Saved: {MODEL_PATH}")
+
+    # Sector-specific models (#29)
+    print("\n--- Sector-specific models ---")
+    df_sorted["sector"] = df_sorted["symbol"].apply(_get_sector)
+    sector_names = list(SECTORS.keys()) + ["other"]
+
+    for sector in sector_names:
+        sector_df = df_sorted[df_sorted["sector"] == sector]
+        if len(sector_df) < 200:
+            print(f"  {sector:<12}: skipped (<200 rows, got {len(sector_df)})")
+            continue
+
+        s_split    = int(len(sector_df) * 0.70)
+        X_s_train  = sector_df.iloc[:s_split][FEATURE_NAMES].values
+        y_s_train  = sector_df.iloc[:s_split]["label"].values
+        X_s_test   = sector_df.iloc[s_split:][FEATURE_NAMES].values
+        y_s_test   = sector_df.iloc[s_split:]["label"].values
+
+        s_model = XGBClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_weight=10,
+            eval_metric="logloss", random_state=42, n_jobs=-1,
+        )
+        s_model.fit(X_s_train, y_s_train, eval_set=[(X_s_test, y_s_test)], verbose=False)
+        s_acc  = float((s_model.predict(X_s_test) == y_s_test).mean())
+        s_path = MODEL_PATH.parent / f"gamma_model_{sector}.pkl"
+        joblib.dump({
+            "model":         s_model,
+            "feature_names": FEATURE_NAMES,
+            "model_type":    "classifier",
+            "dir_acc":       s_acc,
+            "sector":        sector,
+            "train_date":    datetime.date.today().isoformat(),
+        }, s_path)
+        tag = "PASS" if s_acc > 0.52 else "INFO"
+        print(f"  {sector:<12}: acc={s_acc*100:.2f}%  [{tag}]  rows={len(sector_df)}  saved={s_path.name}")
 
 
 if __name__ == "__main__":
