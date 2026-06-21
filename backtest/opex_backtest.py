@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
-OPEX Backtest v2 — Stivers & Sun (2013) replication + Smart OPEX filter
-=======================================================================
-Finding from v1: raw OPEX weeks underperformed 2015-2024 because the
-effect only holds in bull-market regimes (dealers long gamma from call
-selling). Bear-market OPEX weeks see the effect reverse.
+OPEX Backtest v3 — Stivers & Sun (2013) replication across a large-cap basket
+==============================================================================
+Strategy: during OPEX weeks that pass the regime filter, go long an equal-
+weighted basket of large-cap US equities. Compare vs non-OPEX weeks and
+buy-and-hold across the same basket.
 
-Smart OPEX filter (both conditions must be true on the Monday of the week):
-  1. Trend:    SPY close last Friday > SPY 10-week rolling average close
-  2. Momentum: Prior week return > -1% (don't enter after a crash week)
+Smart OPEX filter (evaluated on the Monday open of each OPEX week):
+  1. Trend:    SPY close prior Friday > SPY 10-week rolling average
+  2. Momentum: Prior week basket return > -1%
 
-Strategies compared:
-  - Smart OPEX   (filtered)
-  - Naive OPEX   (all OPEX weeks, for reference)
-  - Buy & Hold   (all weeks)
+Basket: 20 S&P 500 large-caps with continuous history 2015-2024.
+        SPY used as the regime signal and benchmark.
 
-Data: yfinance — free, full 2015-2024 history.
-Gate: Finnhub /calendar/economic if key available, else hardcoded FOMC/CPI/NFP.
-
-Optional env var:
-    FINNHUB_API_KEY
+Data:  yfinance (free, full 2015-2024).
+Gate:  hardcoded FOMC/CPI/NFP dates (Finnhub /calendar/economic is paid).
 
 Usage:
     python backtest/opex_backtest.py
@@ -42,18 +37,25 @@ import yfinance as yf
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 
 START_DATE = "2015-01-01"
-END_DATE = "2024-12-31"
-SYMBOLS = ["AAPL", "SPY"]
-PRIMARY_SYMBOL = "AAPL"
-TREND_LOOKBACK_WEEKS = 10        # SPY MA window for trend filter
-MOMENTUM_FLOOR = -0.01           # prior week must be > -1%
+END_DATE   = "2024-12-31"
 
-FINNHUB_BASE = "https://finnhub.io/api/v1"
+# Equal-weighted large-cap basket (all listed pre-2015, continuous history)
+BASKET = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+    "NVDA", "JPM",  "JNJ",   "XOM",  "UNH",
+    "HD",   "WMT",  "PG",    "BAC",  "MA",
+    "V",    "CVX",  "ABBV",  "MRK",  "PFE",
+]
+SPY = "SPY"   # regime signal + benchmark
+
+TREND_LOOKBACK   = 10     # weeks for SPY MA
+MOMENTUM_FLOOR   = -0.01  # prior basket week must be > -1%
+
+FINNHUB_BASE  = "https://finnhub.io/api/v1"
 GATE_KEYWORDS = {"fomc", "federal open market", "cpi", "consumer price", "nonfarm", "nfp"}
 
 # ---------------------------------------------------------------------------
-# Hardcoded gate dates — FOMC, CPI, NFP release days 2015-2024
-# Used when Finnhub /calendar/economic returns 403 (paid endpoint).
+# Hardcoded gate dates — FOMC, CPI, NFP 2015-2024
 # ---------------------------------------------------------------------------
 _GATE_DATES: set[datetime.date] = {datetime.date.fromisoformat(d) for d in [
     # FOMC
@@ -108,7 +110,7 @@ _GATE_DATES: set[datetime.date] = {datetime.date.fromisoformat(d) for d in [
     "2024-01-11","2024-02-13","2024-03-12","2024-04-10","2024-05-15",
     "2024-06-12","2024-07-11","2024-08-14","2024-09-11","2024-10-10",
     "2024-11-13","2024-12-11",
-    # NFP (first Friday of month)
+    # NFP
     "2015-01-09","2015-02-06","2015-03-06","2015-04-03","2015-05-08",
     "2015-06-05","2015-07-02","2015-08-07","2015-09-04","2015-10-02",
     "2015-11-06","2015-12-04",
@@ -164,27 +166,27 @@ def is_opex_week(date: datetime.date) -> bool:
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def fetch_bars(symbol: str, start: str, end: str) -> pd.DataFrame:
+def fetch_bars(symbol: str) -> pd.DataFrame:
     """Fetch split-adjusted daily bars via yfinance."""
-    df = yf.Ticker(symbol).history(start=start, end=end, auto_adjust=True, actions=False)
+    df = yf.Ticker(symbol).history(
+        start=START_DATE, end=END_DATE, auto_adjust=True, actions=False
+    )
     if df.empty:
-        raise RuntimeError(f"No data for {symbol}")
+        return pd.DataFrame()
     df.index = df.index.tz_localize(None).date if df.index.tz else df.index.date
     return df[["Open", "Close"]].rename(columns={"Open": "open", "Close": "close"})
 
 
 def fetch_blocked_dates() -> set:
-    """Try Finnhub first, fall back to hardcoded dates."""
     if not FINNHUB_API_KEY:
         print("  Using hardcoded FOMC/CPI/NFP dates")
         return _GATE_DATES
-
     blocked: set = set()
-    start_dt = datetime.date.fromisoformat(START_DATE)
-    end_dt = datetime.date.fromisoformat(END_DATE)
-    cur, any_ok = start_dt, False
-    while cur <= end_dt:
-        chunk_end = min(datetime.date(cur.year, 12, 31), end_dt)
+    cur = datetime.date.fromisoformat(START_DATE)
+    end = datetime.date.fromisoformat(END_DATE)
+    any_ok = False
+    while cur <= end:
+        chunk_end = min(datetime.date(cur.year, 12, 31), end)
         try:
             r = requests.get(
                 f"{FINNHUB_BASE}/calendar/economic",
@@ -202,138 +204,164 @@ def fetch_blocked_dates() -> set:
         except requests.RequestException:
             pass
         cur = datetime.date(cur.year + 1, 1, 1)
-
     if any_ok:
         return blocked
-    print("  Finnhub unavailable — using hardcoded FOMC/CPI/NFP dates")
+    print("  Finnhub unavailable — using hardcoded dates")
     return _GATE_DATES
 
 
 # ---------------------------------------------------------------------------
-# Weekly return + signal computation
+# Weekly return computation (per symbol)
 # ---------------------------------------------------------------------------
 
 def group_by_week(df: pd.DataFrame) -> dict:
-    """Returns {(iso_year, iso_week): [date, ...]} sorted."""
     weeks: dict = {}
     for d in sorted(df.index):
         weeks.setdefault(d.isocalendar()[:2], []).append(d)
     return {k: weeks[k] for k in sorted(weeks)}
 
 
-def spy_trend_signal(spy_df: pd.DataFrame, lookback: int = TREND_LOOKBACK_WEEKS) -> dict:
+def weekly_returns_for(df: pd.DataFrame) -> pd.Series:
+    """Return a Series of {week_start: return} for one symbol."""
+    opens  = df["open"].to_dict()
+    closes = df["close"].to_dict()
+    weeks  = group_by_week(df)
+    out = {}
+    for days in weeks.values():
+        first, last = min(days), max(days)
+        if first in opens and last in closes:
+            out[first] = (closes[last] - opens[first]) / opens[first]
+    return pd.Series(out, name="ret").sort_index()
+
+
+# ---------------------------------------------------------------------------
+# SPY regime signals
+# ---------------------------------------------------------------------------
+
+def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Returns {week_start: (uptrend_bool, prior_week_ret)} for each week in SPY data.
-    uptrend = SPY weekly close last week > rolling lookback-week average.
-    Both values use data available before OPEX week opens (prior Friday close).
+    For every week, compute:
+      uptrend    — SPY prior-Friday close > 10-week rolling avg
+      prior_ret  — prior week's SPY return
+    Returns DataFrame indexed by week_start.
     """
+    spy_rets = weekly_returns_for(spy_df)
+    spy_closes = {}
     closes = spy_df["close"].to_dict()
-    weeks = group_by_week(spy_df)
-    week_keys = sorted(weeks.keys())
+    for days in group_by_week(spy_df).values():
+        spy_closes[min(days)] = closes[max(days)]
+    close_s = pd.Series(spy_closes).sort_index()
 
-    # weekly close for each week (last trading day's close)
-    weekly_close = {min(days): closes[max(days)] for days in weeks.values()}
-    week_starts = sorted(weekly_close.keys())
+    ma = close_s.rolling(TREND_LOOKBACK, min_periods=1).mean().shift(1)
+    prior_close = close_s.shift(1)
+    uptrend = (prior_close > ma).reindex(spy_rets.index, fill_value=True)
+    prior_ret = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
 
-    signals: dict = {}
-    for i, ws in enumerate(week_starts):
-        if i == 0:
-            signals[ws] = (True, 0.0)
+    return pd.DataFrame({"uptrend": uptrend, "prior_ret": prior_ret})
+
+
+# ---------------------------------------------------------------------------
+# Basket aggregation
+# ---------------------------------------------------------------------------
+
+def build_basket_weekly(symbols: list[str]) -> pd.DataFrame:
+    """
+    Download all symbols, compute weekly returns, equal-weight average.
+    Returns DataFrame with columns: ret, week_start (index).
+    """
+    print(f"  Downloading {len(symbols)} symbols...")
+    all_rets = {}
+    for sym in symbols:
+        df = fetch_bars(sym)
+        if df.empty or len(df) < 100:
+            print(f"    {sym}: skipped (insufficient data)")
             continue
-        prior_close = weekly_close[week_starts[i - 1]]
-        prior_open_days = weeks[week_keys[i - 1]]
-        prior_open_val = spy_df["open"][min(prior_open_days)]
-        prior_ret = (prior_close - prior_open_val) / prior_open_val
+        all_rets[sym] = weekly_returns_for(df)
+        print(f"    {sym}: {len(df)} bars")
 
-        window_closes = [weekly_close[week_starts[j]] for j in range(max(0, i - lookback), i)]
-        ma = sum(window_closes) / len(window_closes)
-        uptrend = prior_close > ma
-
-        signals[ws] = (uptrend, prior_ret)
-    return signals
+    combined = pd.DataFrame(all_rets).dropna(how="all")
+    basket = combined.mean(axis=1)
+    basket.name = "ret"
+    return basket.to_frame()
 
 
-def compute_weekly_returns(
-    df: pd.DataFrame,
+# ---------------------------------------------------------------------------
+# Signal labelling
+# ---------------------------------------------------------------------------
+
+def label_weeks(
+    basket: pd.DataFrame,
+    spy_signals: pd.DataFrame,
     blocked_dates: set,
-    spy_signals: dict,
+    spy_df: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    Weekly return = (last close - first open) / first open.
-    Columns: ret, naive_opex, smart_opex
-      naive_opex: OPEX week with macro gate applied
-      smart_opex: naive_opex AND uptrend AND prior week > MOMENTUM_FLOOR
+    Add columns: naive_opex, smart_opex to basket weekly returns.
     """
-    opens = df["open"].to_dict()
-    closes = df["close"].to_dict()
-    weeks = group_by_week(df)
+    spy_weeks = group_by_week(spy_df)
+    week_days: dict = {}
+    for key, days in spy_weeks.items():
+        week_days[min(days)] = days
 
     records = []
-    for key in sorted(weeks):
-        days = weeks[key]
-        first, last = min(days), max(days)
-        if first not in opens or last not in closes:
-            continue
-
-        ret = (closes[last] - opens[first]) / opens[first]
-        opex = is_opex_week(first)
+    for ws in basket.index:
+        ret = basket.loc[ws, "ret"]
+        opex = is_opex_week(ws)
 
         # Macro gate
+        days = week_days.get(ws, [ws])
         if opex and any(d in blocked_dates for d in days):
             opex = False
 
-        # Smart filter — requires SPY trend signal for this week
-        uptrend, prior_ret = spy_signals.get(first, (True, 0.0))
+        # Regime filter
+        uptrend  = bool(spy_signals.loc[ws, "uptrend"]) if ws in spy_signals.index else True
+        prior_ret = float(spy_signals.loc[ws, "prior_ret"]) if ws in spy_signals.index else 0.0
         smart = opex and uptrend and prior_ret > MOMENTUM_FLOOR
 
-        records.append({"week_start": first, "ret": ret, "naive_opex": opex, "smart_opex": smart})
+        records.append({"week_start": ws, "ret": ret, "naive_opex": opex, "smart_opex": smart})
 
     return pd.DataFrame(records).set_index("week_start")
 
 
 # ---------------------------------------------------------------------------
-# Stats helpers
+# Stats
 # ---------------------------------------------------------------------------
 
-def annualised_sharpe(rets: pd.Series) -> float:
+def sharpe(rets: pd.Series) -> float:
     std = rets.std()
     return float((rets.mean() / std) * np.sqrt(52)) if std else 0.0
 
 
-def win_rate(rets: pd.Series) -> float:
-    return float((rets > 0).mean())
-
-
 def print_stats(label: str, rets: pd.Series) -> float:
-    mean_pct = rets.mean() * 100
-    print(f"  {label:<18}: n={len(rets):>3}  mean={mean_pct:+.4f}%  "
-          f"Sharpe={annualised_sharpe(rets):.2f}  win={win_rate(rets)*100:.1f}%")
-    return mean_pct
+    m = rets.mean() * 100
+    print(f"  {label:<20}: n={len(rets):>3}  mean={m:+.4f}%  "
+          f"Sharpe={sharpe(rets):.2f}  win={(rets > 0).mean()*100:.1f}%")
+    return m
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_results(weekly: pd.DataFrame, symbol: str, out_path: Path) -> None:
-    smart_rets = weekly[weekly["smart_opex"]]["ret"]
-    naive_rets = weekly[weekly["naive_opex"]]["ret"]
-    non_opex_rets = weekly[~weekly["naive_opex"]]["ret"]
+def plot_basket(weekly: pd.DataFrame, out_dir: Path) -> None:
+    smart_r = weekly[weekly["smart_opex"]]["ret"]
+    naive_r = weekly[weekly["naive_opex"]]["ret"]
+    non_r   = weekly[~weekly["naive_opex"]]["ret"]
 
-    smart_cum = (1 + smart_rets).cumprod()
-    naive_cum = (1 + naive_rets).cumprod()
-    bah_cum = (1 + weekly["ret"]).cumprod()
+    smart_cum = (1 + smart_r).cumprod()
+    naive_cum = (1 + naive_r).cumprod()
+    bah_cum   = (1 + weekly["ret"]).cumprod()
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-    # -- Bar chart --
+    # Bar chart
     labels = ["Smart OPEX", "Naive OPEX", "Non-OPEX"]
-    means = [smart_rets.mean() * 100, naive_rets.mean() * 100, non_opex_rets.mean() * 100]
+    means  = [smart_r.mean() * 100, naive_r.mean() * 100, non_r.mean() * 100]
     colors = ["#2ecc71", "#f39c12", "#e74c3c"]
     bars = ax1.bar(labels, means, color=colors, width=0.5, edgecolor="white", linewidth=1.2)
     ax1.axhline(0, color="#7f8c8d", linewidth=0.8, linestyle="--")
     for bar, val in zip(bars, means):
-        ypos = val + 0.006 if val >= 0 else val - 0.022
+        ypos = val + 0.003 if val >= 0 else val - 0.010
         ax1.text(
             bar.get_x() + bar.get_width() / 2, ypos,
             f"{val:+.3f}%", ha="center", va="bottom",
@@ -342,56 +370,48 @@ def plot_results(weekly: pd.DataFrame, symbol: str, out_path: Path) -> None:
     margin = max(abs(m) for m in means) * 0.6
     ax1.set_ylim(min(0, min(means)) - margin, max(means) + margin)
     ax1.set_ylabel("Mean Weekly Return (%)", fontsize=10)
-    ax1.set_title(f"{symbol} — Mean Weekly Return\nSmart vs Naive OPEX, 2015-2024", fontsize=10)
+    ax1.set_title("20-Stock Basket — Mean Weekly Return\nSmart vs Naive OPEX, 2015-2024", fontsize=10)
 
-    # -- Cumulative chart --
+    # Cumulative chart
     ax2.plot(smart_cum.index, smart_cum.values, label="Smart OPEX", color="#2ecc71", linewidth=2.2)
-    ax2.plot(naive_cum.index, naive_cum.values, label="Naive OPEX", color="#f39c12",
-             linewidth=1.4, linestyle="--")
-    ax2.plot(bah_cum.index, bah_cum.values, label="Buy & Hold", color="#2980b9",
-             linewidth=1.2, alpha=0.7)
+    ax2.plot(naive_cum.index, naive_cum.values, label="Naive OPEX",
+             color="#f39c12", linewidth=1.4, linestyle="--")
+    ax2.plot(bah_cum.index, bah_cum.values, label="Buy & Hold (equal-weight)",
+             color="#2980b9", linewidth=1.2, alpha=0.7)
     ax2.set_ylabel("Cumulative Return (x)", fontsize=10)
-    ax2.set_title(f"{symbol} — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
+    ax2.set_title("20-Stock Basket — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
     ax2.legend(fontsize=9)
     ax2.grid(alpha=0.25)
     ax2.tick_params(axis="x", labelrotation=30, labelsize=8)
 
     plt.suptitle(
-        f"OPEX Backtest v2  -  {symbol}  -  Stivers & Sun (2013) + Regime Filter",
+        "OPEX Backtest v3  -  20-Stock Large-Cap Basket  -  Stivers & Sun (2013)",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    path = out_dir / "opex_backtest_basket.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Chart saved: {out_path}")
+    print(f"  Chart saved: {path}")
 
 
-# ---------------------------------------------------------------------------
-# Per-symbol runner
-# ---------------------------------------------------------------------------
+def plot_per_stock(per_stock: dict[str, dict], out_dir: Path) -> None:
+    """Bar chart of Smart OPEX mean return per stock."""
+    syms   = sorted(per_stock, key=lambda s: per_stock[s]["smart_mean"], reverse=True)
+    means  = [per_stock[s]["smart_mean"] for s in syms]
+    colors = ["#2ecc71" if m > 0 else "#e74c3c" for m in means]
 
-def run(symbol: str, blocked_dates: set, spy_signals: dict) -> None:
-    print(f"\n{'─'*55}")
-    print(f"  {symbol}  |  {START_DATE} to {END_DATE}")
-    print(f"{'─'*55}")
-
-    df = fetch_bars(symbol, START_DATE, END_DATE)
-    print(f"  Daily bars : {len(df)}")
-
-    weekly = compute_weekly_returns(df, blocked_dates, spy_signals)
-
-    smart_mean = print_stats("Smart OPEX", weekly[weekly["smart_opex"]]["ret"])
-    naive_mean = print_stats("Naive OPEX", weekly[weekly["naive_opex"]]["ret"])
-    non_mean   = print_stats("Non-OPEX", weekly[~weekly["naive_opex"]]["ret"])
-
-    if symbol == PRIMARY_SYMBOL:
-        passed = smart_mean > 0.30 and non_mean < 0.20
-        tag = "PASS" if passed else "INFO"
-        print(f"\n  [{tag}] Demo target: Smart OPEX {smart_mean:.3f}% (need >0.30%), "
-              f"Non-OPEX {non_mean:.3f}% (need <0.20%)")
-
-    out_path = Path(__file__).parent / f"opex_backtest_{symbol}.png"
-    plot_results(weekly, symbol, out_path)
+    fig, ax = plt.subplots(figsize=(14, 5))
+    bars = ax.bar(syms, means, color=colors, edgecolor="white", linewidth=0.8)
+    ax.axhline(0, color="#7f8c8d", linewidth=0.8, linestyle="--")
+    ax.set_ylabel("Smart OPEX Mean Weekly Return (%)", fontsize=10)
+    ax.set_title("Smart OPEX Mean Return by Stock  (2015-2024)", fontsize=11)
+    ax.tick_params(axis="x", labelsize=9)
+    plt.tight_layout()
+    path = out_dir / "opex_backtest_per_stock.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Chart saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -399,20 +419,56 @@ def run(symbol: str, blocked_dates: set, spy_signals: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("OPEX Backtest v2 - Smart Regime Filter")
-    print(f"Symbols: {SYMBOLS}  |  {START_DATE} to {END_DATE}")
-    print(f"Filter:  SPY {TREND_LOOKBACK_WEEKS}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
+    print("OPEX Backtest v3 - 20-Stock Large-Cap Basket")
+    print(f"Basket : {BASKET}")
+    print(f"Period : {START_DATE} to {END_DATE}")
+    print(f"Filter : SPY {TREND_LOOKBACK}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
 
     print("Loading macro gate dates...")
-    blocked_dates = fetch_blocked_dates()
-    print(f"  Gate dates: {len(blocked_dates)}")
+    blocked = fetch_blocked_dates()
+    print(f"  Gate dates: {len(blocked)}\n")
 
-    print("\nComputing SPY trend signals...")
-    spy_df = fetch_bars("SPY", START_DATE, END_DATE)
-    spy_signals = spy_trend_signal(spy_df)
+    print("Downloading SPY for regime signal...")
+    spy_df = fetch_bars(SPY)
+    spy_signals = build_spy_signals(spy_df)
+    print(f"  SPY bars: {len(spy_df)}\n")
 
-    for sym in SYMBOLS:
-        run(sym, blocked_dates, spy_signals)
+    print("Building basket weekly returns...")
+    basket = build_basket_weekly(BASKET)
+    print(f"  Basket weeks: {len(basket)}\n")
+
+    print("Labelling OPEX / Smart OPEX weeks...")
+    weekly = label_weeks(basket, spy_signals, blocked, spy_df)
+
+    print("\n--- Basket Results ---")
+    smart_mean = print_stats("Smart OPEX", weekly[weekly["smart_opex"]]["ret"])
+    naive_mean = print_stats("Naive OPEX", weekly[weekly["naive_opex"]]["ret"])
+    non_mean   = print_stats("Non-OPEX",   weekly[~weekly["naive_opex"]]["ret"])
+
+    passed = smart_mean > 0.30 and non_mean < 0.20
+    tag = "PASS" if passed else "INFO"
+    print(f"\n  [{tag}] Demo target: Smart OPEX {smart_mean:.3f}% (need >0.30%), "
+          f"Non-OPEX {non_mean:.3f}% (need <0.20%)")
+
+    out_dir = Path(__file__).parent
+    plot_basket(weekly, out_dir)
+
+    # Per-stock breakdown
+    print("\n--- Per-Stock Smart OPEX ---")
+    per_stock = {}
+    for sym in BASKET:
+        df = fetch_bars(sym)
+        if df.empty:
+            continue
+        sym_weekly = weekly_returns_for(df).to_frame()
+        sym_weekly = label_weeks(sym_weekly, spy_signals, blocked, spy_df)
+        sm = sym_weekly[sym_weekly["smart_opex"]]["ret"]
+        if len(sm):
+            mean_pct = print_stats(sym, sm)
+            per_stock[sym] = {"smart_mean": mean_pct}
+
+    if per_stock:
+        plot_per_stock(per_stock, out_dir)
 
     print("\nDone.")
 
