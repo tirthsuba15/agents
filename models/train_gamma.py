@@ -14,12 +14,13 @@ pkl loads transparently into gamma_model.py inference):
   smirk           <- -skewness(20d returns)   (put demand proxy)
   pcr             <- downvol_fraction          (bearish flow proxy)
   gex_regime_flag <- sign(close - SMA20)       (trend / gamma regime proxy)
-  vix_level       <- ^VIX daily close          (exact — free from yfinance)
+  vix_level       <- ^VIX daily close          (exact -- free from yfinance)
   mom4w           <- 4-week price return        (short-term momentum)
   rsi14           <- 14-week RSI                (overbought / oversold)
   hpr52           <- close / 52wk-high          (breakout proximity)
+  macro_flag      <- 1 if date is within 3 days of FOMC/CPI/NFP event
 
-Label: binary — 1 if stock outperformed SPY next week, 0 otherwise.
+Label: binary -- 1 if stock outperformed SPY next week, 0 otherwise.
 
 Usage:
     python models/train_gamma.py
@@ -40,14 +41,14 @@ warnings.filterwarnings("ignore")
 MODEL_PATH    = Path(__file__).parent / "gamma_model.pkl"
 FEATURE_NAMES = [
     "iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level",
-    "mom4w", "rsi14", "hpr52", "gex_x_vix",
+    "mom4w", "rsi14", "hpr52", "gex_x_vix", "macro_flag",
 ]
 
 START = "2019-01-01"
 END   = datetime.date.today().isoformat()
 
 # ---------------------------------------------------------------------------
-# Universe — ~110 tickers across all S&P 500 sectors + sector ETFs
+# Universe -- ~110 tickers across all S&P 500 sectors + sector ETFs
 # ---------------------------------------------------------------------------
 UNIVERSE = [
     # Mega-cap tech & semiconductors
@@ -71,7 +72,7 @@ UNIVERSE = [
     "NEE", "DUK", "SO", "PLD", "EQIX",
     # Communications
     "T", "VZ", "DIS",
-    # Sector & broad ETFs (high option volume — great signal quality)
+    # Sector & broad ETFs (high option volume -- great signal quality)
     "SPY", "QQQ", "IWM", "GLD", "TLT",
     "XLF", "XLK", "XLE", "XLV", "XLI", "XLU", "XLP", "XLY", "XLB",
     "SMH", "HYG", "EFA", "EEM",
@@ -102,6 +103,48 @@ def _get_sector(symbol: str) -> str:
         if symbol in tickers:
             return sector
     return "other"
+
+
+# ---------------------------------------------------------------------------
+# Macro event gate flag (#31)
+# ---------------------------------------------------------------------------
+
+def is_macro_week(date) -> int:
+    """
+    Returns 1 if the date falls within 3 calendar days of a high-impact
+    macro event: FOMC decision, CPI release, or NFP release.
+
+    NFP:  first Friday of each month (day <= 7 and weekday == 4)
+    CPI:  typically released on the 10th-16th of each month
+    FOMC: hardcoded meeting end dates 2023-2026
+    """
+    fomc_dates = {
+        datetime.date(2023,2,1),  datetime.date(2023,3,22), datetime.date(2023,5,3),
+        datetime.date(2023,6,14), datetime.date(2023,7,26), datetime.date(2023,9,20),
+        datetime.date(2023,11,1), datetime.date(2023,12,13),
+        datetime.date(2024,1,31), datetime.date(2024,3,20), datetime.date(2024,5,1),
+        datetime.date(2024,6,12), datetime.date(2024,7,31), datetime.date(2024,9,18),
+        datetime.date(2024,11,7), datetime.date(2024,12,18),
+        datetime.date(2025,1,29), datetime.date(2025,3,19), datetime.date(2025,5,7),
+        datetime.date(2025,6,18), datetime.date(2025,7,30), datetime.date(2025,9,17),
+        datetime.date(2025,11,7), datetime.date(2025,12,10),
+        datetime.date(2026,1,28), datetime.date(2026,3,18), datetime.date(2026,4,29),
+        datetime.date(2026,6,17),
+    }
+    # Normalise to a plain date object
+    if hasattr(date, "date"):
+        date = date.date()
+
+    # Within 3 days of FOMC decision date
+    for fd in fomc_dates:
+        if abs((date - fd).days) <= 3:
+            return 1
+
+    # CPI week: 10th-16th of each month
+    if 10 <= date.day <= 16:
+        return 1
+
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +190,7 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
     sma20 = close.rolling(20).mean()
     gex_w = np.sign(close - sma20).resample("W-FRI").last()
 
-    # gex_x_vix interaction: trend direction × short-term vol (#30)
+    # gex_x_vix interaction: trend direction x short-term vol (#30)
     gex_x_vix_d = np.sign(close - sma20) * hv(close, 10)
     gex_x_vix_w = gex_x_vix_d.resample("W-FRI").last()
 
@@ -156,6 +199,11 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
     mom4w_w  = close_w.pct_change(4)
     rsi14_w  = rsi_weekly(close_w, 14)
     hpr52_w  = close_w / close_w.rolling(52).max()
+
+    # macro_flag: 1 if the weekly date is within 3 days of FOMC/CPI/NFP
+    macro_flag_w = close_w.index.to_series().apply(
+        lambda d: is_macro_week(d.date() if hasattr(d, "date") else d)
+    )
 
     df = pd.DataFrame({
         "iv_spread":       iv_spread_w,
@@ -166,6 +214,7 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
         "rsi14":           rsi14_w,
         "hpr52":           hpr52_w,
         "gex_x_vix":       gex_x_vix_w,
+        "macro_flag":      macro_flag_w,
     })
 
     # Align VIX on the same weekly index
@@ -224,10 +273,10 @@ def build_dataset() -> pd.DataFrame:
             print(f"  [{i:>3}/{total}] {sym:<6}: {len(merged):>4} weeks")
 
         except Exception as exc:
-            print(f"  [{i:>3}/{total}] {sym:<6}: error — {exc}")
+            print(f"  [{i:>3}/{total}] {sym:<6}: error -- {exc}")
 
     if not all_rows:
-        raise RuntimeError("No data built — check internet connection")
+        raise RuntimeError("No data built -- check internet connection")
 
     return pd.concat(all_rows).rename_axis("date").reset_index()
 
@@ -237,7 +286,7 @@ def build_dataset() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def train() -> None:
-    print(f"Building dataset — {len(UNIVERSE)} tickers, {START} to {END}...")
+    print(f"Building dataset -- {len(UNIVERSE)} tickers, {START} to {END}...")
     df = build_dataset()
 
     vc = df["label"].value_counts()
@@ -294,7 +343,7 @@ def train() -> None:
         "feature_names": FEATURE_NAMES,
         "model_type":    "classifier",
         "dir_acc":       acc,
-        "trained_on":    "price_proxies_v3",
+        "trained_on":    "price_proxies_v4",
         "universe_size": df["symbol"].nunique(),
         "train_date":    datetime.date.today().isoformat(),
     }, MODEL_PATH)
