@@ -202,6 +202,32 @@ def get_agent_weights() -> dict:
     return {k: weights.get(k) for k in ("w_sentiment", "w_momentum", "w_gamma")}
 
 
+def _delete_memory(memory_id: str) -> None:
+    import requests as _req
+    url = f"{HYDRA_DB_BASE_URL}/memories/delete_memory"
+    params = {
+        "tenant_id": HYDRA_DB_TENANT_ID,
+        "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+        "memory_id": memory_id,
+    }
+    resp = _req.delete(url, headers=HEADERS, params=params, timeout=15)
+    resp.raise_for_status()
+
+
+def clear_all_memories() -> int:
+    items = _list_all_ids()
+    count = 0
+    for item in items:
+        mid = item.get("memory_id")
+        if mid:
+            try:
+                _delete_memory(mid)
+                count += 1
+            except Exception:
+                pass
+    return count
+
+
 def query_rag(signals_json: str, top_k: int = 5) -> list[dict]:
     from embedder import embed
     emb = embed(signals_json)
