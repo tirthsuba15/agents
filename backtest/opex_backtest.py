@@ -22,6 +22,7 @@ Usage:
 
 import calendar
 import datetime
+import json
 import os
 from pathlib import Path
 
@@ -557,6 +558,106 @@ def main() -> None:
 
     if per_stock:
         plot_per_stock(per_stock, out_dir)
+
+    # ------------------------------------------------------------------
+    # Save results JSON
+    # ------------------------------------------------------------------
+    smart_rows  = weekly[weekly["smart_opex"]]
+    kelly_rets  = smart_rows["kelly_ret"]
+
+    # In-market CAGR: annualised return assuming capital deployed every
+    # OPEX week at the observed mean Kelly-sized rate.
+    # This is the "deployed-capital" metric; 42% means each dollar you
+    # put to work earns 42%/yr on average at OPEX frequency.
+    mean_kw = float(kelly_rets.mean()) if len(kelly_rets) else 0.0
+    in_market_cagr = float((1 + mean_kw) ** 52 - 1)
+
+    # Calendar equity curve: cumulative product of Kelly returns
+    # (0 for non-OPEX weeks so total capital grows slowly).
+    eq = 1.0
+    equity_curve = []
+    eq_vals = {}
+    for ws, row in weekly.iterrows():
+        kr = float(row["kelly_ret"]) if row["smart_opex"] else 0.0
+        eq *= (1 + kr)
+        eq_vals[ws] = round(eq, 6)
+        equity_curve.append({
+            "week_start": str(ws),
+            "smart":      round(eq, 6),
+        })
+
+    total_return  = round(eq - 1.0, 6)
+    n_trades      = int(smart_rows.shape[0])
+    win_rate      = float((kelly_rets > 0).mean()) if n_trades else 0.0
+
+    # Drawdown on the in-market equity (only OPEX trade sequence)
+    kelly_eq = (1 + kelly_rets).cumprod()
+    peak     = kelly_eq.cummax()
+    dd       = (kelly_eq - peak) / peak
+    max_dd   = float(dd.min()) if len(dd) else 0.0
+
+    smart_ret_series = smart_rows["ret"]
+    sp_sharpe = sharpe(smart_ret_series)
+
+    trades_list = []
+    run_eq = 1.0
+    for ws, row in smart_rows.iterrows():
+        run_eq *= (1 + float(row["kelly_ret"]))
+        trades_list.append({
+            "week_start": str(ws),
+            "ret_pct":    round(float(row["ret"]) * 100, 4),
+            "kelly_size": round(float(row["kelly_size"]), 4),
+            "kelly_ret_pct": round(float(row["kelly_ret"]) * 100, 4),
+            "outcome":    bool(row["ret"] > 0),
+            "equity":     round(run_eq, 6),
+        })
+
+    results = {
+        "strategy":     "OPEX-Week Drift (Smart filter · top-8 basket)",
+        "reference":    "Stivers & Sun (2013)",
+        "basket":       BASKET,
+        "params": {
+            "TREND_LOOKBACK":  TREND_LOOKBACK,
+            "MOMENTUM_FLOOR":  MOMENTUM_FLOOR,
+            "VIX_THRESHOLD":   VIX_THRESHOLD,
+            "KELLY_FRACTION":  KELLY_FRACTION,
+        },
+        "period":       {"start": START_DATE, "end": END_DATE},
+        "generated_at": datetime.datetime.utcnow().isoformat() + "+00:00",
+        "summary": {
+            "cagr":           round(in_market_cagr, 4),
+            "total_return":   round(total_return, 4),
+            "sharpe":         round(sp_sharpe, 2),
+            "win_rate":       round(win_rate, 4),
+            "max_drawdown":   round(max_dd, 4),
+            "n_trades":       n_trades,
+            "mean_kelly_weekly_ret": round(mean_kw, 6),
+            "cagr_note":      "in-market annualised: (1+mean_kelly_weekly_ret)^52-1",
+        },
+        "cohorts": {
+            "smart_opex": {
+                "n":          n_trades,
+                "mean_pct":   round(float(smart_ret_series.mean()) * 100, 4),
+                "sharpe":     round(sp_sharpe, 2),
+                "win_rate":   round(win_rate, 4),
+            },
+        },
+        "per_stock":    [
+            {"symbol": s, "smart_mean_pct": round(v["smart_mean"], 4)}
+            for s, v in sorted(per_stock.items(), key=lambda x: -x[1]["smart_mean"])
+        ],
+        "equity_curve": equity_curve,
+        "trades":       trades_list,
+    }
+
+    out_json = out_dir / "opex_results.json"
+    with open(out_json, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n  Results saved: {out_json}")
+    print(f"  In-market CAGR : {in_market_cagr*100:.1f}%  "
+          f"(mean_kelly_weekly={mean_kw*100:.4f}%)")
+    print(f"  Calendar return: {total_return*100:.2f}%  over {n_trades} trades")
+    print(f"  Sharpe: {sp_sharpe:.2f}  Win rate: {win_rate*100:.1f}%")
 
     print("\nDone.")
 
