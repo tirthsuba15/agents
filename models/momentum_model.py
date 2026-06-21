@@ -23,6 +23,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
 FEATURE_NAMES = [
@@ -98,10 +99,11 @@ def predict_momentum(features_dict: dict) -> dict:
     """
     model, lgbm = _load_models()
     vec      = np.array([[features_dict[f] for f in FEATURE_NAMES]], dtype=float)
-    xgb_proba = float(model.predict_proba(vec)[0][1])
+    vec_df   = pd.DataFrame(vec, columns=FEATURE_NAMES)
+    xgb_proba = float(model.predict_proba(vec_df)[0][1])
 
     if lgbm is not None:
-        lgbm_proba = float(lgbm.predict_proba(vec)[0][1])
+        lgbm_proba = float(lgbm.predict_proba(vec_df)[0][1])
         proba = (xgb_proba + lgbm_proba) / 2
     else:
         proba = xgb_proba

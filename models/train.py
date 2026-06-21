@@ -285,6 +285,7 @@ def _best_params() -> dict:
         "learning_rate": 0.10755931942705539,
         "subsample": 0.9573473068520665,
         "colsample_bytree": 0.6554059690938256,
+        "min_child_weight": 7,
         "eval_metric": "logloss",
         "random_state": 42,
         "n_jobs": -1,
@@ -303,16 +304,15 @@ def train(params: dict = None) -> None:
     vc = df["label"].value_counts()
     print(f"  Label balance  : class-1={vc.get(1,0):,}  class-0={vc.get(0,0):,}")
 
-    X = df[FEATURE_NAMES].values
-    y = df["label"].values
+    X = df[FEATURE_NAMES]
+    y = df["label"]
 
     split   = int(len(df) * 0.70)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
     print(f"  Train / Test   : {len(X_train):,} / {len(X_test):,}")
 
-    xgb_params = {k: v for k, v in params.items() if k != "min_child_weight"}
-    model = XGBClassifier(**xgb_params)
+    model = XGBClassifier(**params)
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
     acc = float((model.predict(X_test) == y_test).mean())
@@ -354,8 +354,56 @@ def train(params: dict = None) -> None:
     print(f"\n  Saved: {MODEL_PATH}")
 
 
+def walk_forward(window_months: int = 18):
+    print(f"Building dataset for walk-forward validation ({window_months}mo window)...")
+    df = build_dataset()
+    dates = pd.DatetimeIndex(df.index)
+    print(f"\n  Samples        : {len(df):,}")
+    print(f"  Date range     : {dates.min().date()} to {dates.max().date()}")
+    vc = df["label"].value_counts()
+    print(f"  Label balance  : class-1={vc.get(1,0):,}  class-0={vc.get(0,0):,}")
+
+    month_starts = sorted(set(d.replace(day=1) for d in dates))
+    step_accs = []
+
+    for i, step_start in enumerate(month_starts):
+        if i == 0:
+            continue
+        step_end = month_starts[i + 1] if i + 1 < len(month_starts) else dates.max() + pd.Timedelta(days=1)
+
+        test_mask = (dates >= step_start) & (dates < step_end)
+        if test_mask.sum() < 5:
+            continue
+
+        train_start = step_start - pd.DateOffset(months=window_months)
+        train_mask = (dates >= train_start) & (dates < step_start)
+        if train_mask.sum() < 50:
+            continue
+
+        X_tr = df.loc[train_mask, FEATURE_NAMES]
+        X_te = df.loc[test_mask, FEATURE_NAMES]
+        y_tr = df.loc[train_mask, "label"]
+        y_te = df.loc[test_mask, "label"]
+
+        model = XGBClassifier(**_best_params())
+        model.fit(X_tr, y_tr, verbose=False)
+
+        preds = model.predict(X_te)
+        acc = float((preds == y_te).mean())
+        step_accs.append(acc)
+        print(f"  {train_start.date()} -> {step_start.date()} : acc={acc*100:.2f}%  "
+              f"(train={len(X_tr)}, test={len(X_te)})")
+
+    overall = float(np.mean(step_accs)) if step_accs else 0.0
+    print(f"\n  Walk-forward accuracy: {overall*100:.2f}%  "
+          f"(mean of {len(step_accs)} steps)")
+    print(f"  (compare to static 70/30 split accuracy from train())")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "tune":
         tune()
+    elif len(sys.argv) > 1 and "walkforward" in sys.argv:
+        walk_forward()
     else:
         train()
