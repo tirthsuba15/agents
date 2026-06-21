@@ -1,10 +1,13 @@
 """
-StratOS — LangGraph StateGraph scaffold (Phase 1).
+StratOS — LangGraph StateGraph (Phase 2).
 
 Flow:
-  fetch_data → sentiment_node → momentum_node → gamma_node
+  fetch_data → sentiment_node → momentum_node → gamma_node → zero_dte_node
   → meta_node ──┬── (|conviction| > 0.35 AND regime agreement) ──→ execute_node → memory_node
                 └── (pass)                                       ──→ memory_node
+
+Signal format: sentiment + zero_dte return SignalObject dicts (direction, conviction, regime, ...).
+               momentum + gamma return floats (Person C stubs — updated in Phase 3).
 """
 from __future__ import annotations
 
@@ -15,14 +18,14 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 
-# ── stub dependencies (replaced by real modules in later phases) ──
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import hydradb
 import embedder
-from agents.sentiment import score_sentiment
+from agents.sentiment import score_sentiment, SignalObject
 from agents.momentum_model import score_momentum
 from agents.gamma_model import score_gamma
+from agents.zero_dte import score_zero_dte
 from execution.alpaca import submit_order
 
 
@@ -63,16 +66,16 @@ def fetch_data(state: AgentState) -> dict:
 
 
 def sentiment_node(state: AgentState) -> dict:
-    """Run sentiment agent on fetched news."""
+    """Run sentiment agent. Stores full SignalObject under signals['sentiment']."""
     ticker = state["ticker"]
     news = state["signals"].get("_raw_news", [])
 
-    score = score_sentiment(ticker, news)
+    signal = score_sentiment(ticker, news)
 
     return {
         "signals": {
             **state["signals"],
-            "sentiment": score,
+            "sentiment": signal,   # SignalObject dict
         }
     }
 
@@ -99,49 +102,97 @@ def gamma_node(state: AgentState) -> dict:
     return {
         "signals": {
             **state["signals"],
-            "gamma": score,
+            "gamma": score,   # float — Person C stub; becomes SignalObject in Phase 3
         }
     }
+
+
+def zero_dte_node(state: AgentState) -> dict:
+    """Run 0DTE flow agent. Stores SignalObject under signals['zero_dte']."""
+    ticker = state["ticker"]
+    options_chain = state["signals"].get("_raw_options", {})
+
+    signal = score_zero_dte(ticker, options_chain)
+
+    return {
+        "signals": {
+            **state["signals"],
+            "zero_dte": signal,   # SignalObject dict; weight capped at 5% in meta_node
+        }
+    }
+
+
+def _extract_direction(signal: SignalObject | float) -> float:
+    """Extract scalar direction from either a SignalObject dict or a raw float."""
+    if isinstance(signal, dict):
+        return float(signal.get("direction", 0.0))
+    return float(signal)
 
 
 def meta_node(state: AgentState) -> dict:
     """
     Fuse signals + weights → conviction score + trade decision.
-    Phase 1: weighted sum. Phase 2: replace inner logic with Qwen3 235B on Nebius.
+    Phase 2: weighted sum with SignalObject support + zero_dte capped at 5%.
+    Phase 3: replace fusion logic with Qwen3 235B on Nebius Serverless AI.
     """
     signals = state["signals"]
     weights = state["weights"]
     ticker = state["ticker"]
     regime = state["regime"]
 
-    s = signals.get("sentiment", 0.0)
-    m = signals.get("momentum", 0.0)
-    g = signals.get("gamma", 0.0)
+    # Extract direction from each signal (handles both SignalObject and float)
+    s = _extract_direction(signals.get("sentiment", 0.0))
+    m = _extract_direction(signals.get("momentum", 0.0))
+    g = _extract_direction(signals.get("gamma", 0.0))
+    z = _extract_direction(signals.get("zero_dte", 0.0))
 
-    w_s = weights.get("w_sentiment", 0.33)
+    # Base weights (sum to 1.0 after zero_dte cap)
+    w_s = weights.get("w_sentiment", 0.38)
     w_m = weights.get("w_momentum", 0.33)
-    w_g = weights.get("w_gamma", 0.34)
+    w_g = weights.get("w_gamma", 0.24)
+    w_z = 0.05  # zero_dte hard-capped at 5%
 
-    conviction = (w_s * s) + (w_m * m) + (w_g * g)
+    # Renormalize base weights to leave 5% for zero_dte
+    base_total = w_s + w_m + w_g
+    scale = (1.0 - w_z) / base_total if base_total > 0 else 1.0
+    w_s, w_m, w_g = w_s * scale, w_m * scale, w_g * scale
 
-    print(f"[meta_node] conviction={conviction:.4f} regime={regime}")
-    print(f"  sentiment={s:.3f}×{w_s} + momentum={m:.3f}×{w_m} + gamma={g:.3f}×{w_g}")
+    conviction = (w_s * s) + (w_m * m) + (w_g * g) + (w_z * z)
 
-    # Phase 2: send signals + weights to Qwen3 235B via Nebius Serverless AI
-    # to generate a structured trade decision with reasoning.
+    # Derive regime from sentiment SignalObject if available, else from state
+    sentiment_obj = signals.get("sentiment")
+    derived_regime = (
+        sentiment_obj.get("regime", regime)
+        if isinstance(sentiment_obj, dict)
+        else regime
+    )
+
+    print(f"[meta_node] conviction={conviction:.4f} regime={derived_regime}")
+    print(
+        f"  s={s:.3f}×{w_s:.3f} + m={m:.3f}×{w_m:.3f} "
+        f"+ g={g:.3f}×{w_g:.3f} + z={z:.3f}×{w_z:.3f}"
+    )
+
+    # Phase 3: send signals + weights to Qwen3 235B via Nebius Serverless AI.
     action = "BUY" if conviction > 0 else "SELL"
     trade_decision = {
         "ticker": ticker,
         "action": action,
         "qty": 10,
-        "entry_price": 150.0,   # Phase 2: pull from real market data
+        "entry_price": 150.0,   # Phase 3: pull from real market data
         "conviction": conviction,
-        "regime": regime,
-        "signals": {k: v for k, v in signals.items() if not k.startswith("_")},
+        "regime": derived_regime,
+        "signal_summary": {
+            "sentiment_direction": s,
+            "momentum_direction": m,
+            "gamma_direction": g,
+            "zero_dte_direction": z,
+        },
     }
 
     return {
         "conviction": conviction,
+        "regime": derived_regime,
         "trade_decision": trade_decision,
     }
 
@@ -229,6 +280,7 @@ def build_graph() -> StateGraph:
     g.add_node("sentiment_node", sentiment_node)
     g.add_node("momentum_node", momentum_node)
     g.add_node("gamma_node", gamma_node)
+    g.add_node("zero_dte_node", zero_dte_node)
     g.add_node("meta_node", meta_node)
     g.add_node("execute_node", execute_node)
     g.add_node("memory_node", memory_node)
@@ -237,7 +289,8 @@ def build_graph() -> StateGraph:
     g.add_edge("fetch_data", "sentiment_node")
     g.add_edge("sentiment_node", "momentum_node")
     g.add_edge("momentum_node", "gamma_node")
-    g.add_edge("gamma_node", "meta_node")
+    g.add_edge("gamma_node", "zero_dte_node")
+    g.add_edge("zero_dte_node", "meta_node")
 
     g.add_conditional_edges(
         "meta_node",
