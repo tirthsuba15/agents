@@ -32,15 +32,20 @@ except ImportError:
     )
 
 TOKEN_FACTORY_URL = "https://iam.api.nebius.cloud/iam/v1/tokens"
-MODEL_ID          = "nvidia/Llama-3.1-Nemotron-70B-Instruct-HF"
+MODEL_ID          = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"
 
 _token_cache: dict = {}   # {token, expires_at}
 
 
 def _get_iam_token() -> str:
     """
-    Exchange NEBIUS_API_KEY for a short-lived IAM token via the Nebius Token Factory.
-    Caches the token until 5 minutes before expiry.
+    Resolve auth token for Nebius API.
+
+    Strategy:
+    1. If NEBIUS_API_KEY starts with 'v1.' it is a static Nebius API key —
+       use it directly as Bearer (no token factory exchange needed).
+    2. Otherwise treat it as an OAuth token and exchange via Token Factory
+       (POST iam.api.nebius.cloud/iam/v1/tokens) for a short-lived IAM token.
     """
     now = time.time()
     cached = _token_cache.get("token")
@@ -50,6 +55,13 @@ def _get_iam_token() -> str:
     if not NEBIUS_API_KEY:
         raise EnvironmentError("NEBIUS_API_KEY is not set. Add it to .env.")
 
+    # Static API key — use directly, no exchange needed
+    if NEBIUS_API_KEY.startswith("v1."):
+        _token_cache["token"]      = NEBIUS_API_KEY
+        _token_cache["expires_at"] = now + 23 * 3600
+        return NEBIUS_API_KEY
+
+    # OAuth token — exchange at token factory
     try:
         resp = requests.post(
             TOKEN_FACTORY_URL,
@@ -60,14 +72,13 @@ def _get_iam_token() -> str:
             data = resp.json()
             token = data.get("iamToken", "")
             if token:
-                # expiresAt is ISO8601; cache for 12 hours minus buffer
                 _token_cache["token"]      = token
                 _token_cache["expires_at"] = now + 12 * 3600 - 300
                 return token
     except Exception as exc:
         print(f"  [nebius] token factory exchange failed: {exc} — using API key directly", file=sys.stderr)
 
-    # Fallback: treat NEBIUS_API_KEY as a direct Bearer token
+    # Fallback: use key directly
     _token_cache["token"]      = NEBIUS_API_KEY
     _token_cache["expires_at"] = now + 3600
     return NEBIUS_API_KEY
