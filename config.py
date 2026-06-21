@@ -18,3 +18,8 @@ NEBIUS_SERVERLESS_ENDPOINT: str = os.environ.get(
 )
 
 FINNHUB_API_KEY: str = os.environ.get("FINNHUB_API_KEY", "")
+
+HYDRA_DB_API_KEY: str = os.environ.get("HYDRA_DB_API_KEY", "")
+HYDRA_DB_BASE_URL: str = os.environ.get("HYDRA_DB_BASE_URL", "https://api.hydradb.com")
+HYDRA_DB_TENANT_ID: str = os.environ.get("HYDRA_DB_TENANT_ID", "agents")
+HYDRA_DB_SUB_TENANT_ID: str = os.environ.get("HYDRA_DB_SUB_TENANT_ID", "day_trading")

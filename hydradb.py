@@ -1,56 +1,278 @@
 """
-Person B's HydraDB client — stub.
-Replace with real implementation when Person B delivers hydradb.py.
-Exposes: get_weights, get_agent_weights, query_rag, log_trade, log_pass.
+Person B's real HydraDB client.
+Falls back to stub behaviour if HYDRA_DB_API_KEY is not set.
 """
 from __future__ import annotations
-from typing import Any
+import json
+import os
+import time
+import uuid
+from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+load_dotenv()
 
-def get_weights(ticker: str) -> dict:
-    """Fetch signal weights for a ticker. Stub returns defaults."""
-    return {
-        "w_sentiment": 0.4,
-        "w_momentum": 0.35,
-        "w_gamma": 0.25,
-    }
+from config import (
+    HYDRA_DB_API_KEY,
+    HYDRA_DB_BASE_URL,
+    HYDRA_DB_TENANT_ID,
+    HYDRA_DB_SUB_TENANT_ID,
+)
 
+_LIVE = bool(HYDRA_DB_API_KEY)
 
-def get_agent_weights() -> dict:
-    """
-    Read from agent_weights table (latest row).
-    Returns w_sentiment, w_momentum, w_gamma.
-    Stub returns equal weights; real impl reads from HydraDB agent_weights table.
-    """
+# ── Stub implementations (used when key absent) ───────────────────────────
+
+def _stub_get_weights(ticker: str) -> dict:
+    return {"w_sentiment": 0.4, "w_momentum": 0.35, "w_gamma": 0.25}
+
+def _stub_get_agent_weights() -> dict:
     print("[HydraDB STUB] get_agent_weights → defaults")
-    return {
-        "w_sentiment": 0.33,
-        "w_momentum": 0.33,
-        "w_gamma": 0.34,
-    }
+    return {"w_sentiment": 0.33, "w_momentum": 0.33, "w_gamma": 0.34}
 
-
-def query_rag(query_text: str, top_k: int = 5) -> list[dict]:
-    """
-    Retrieve top-k most similar past trade setups by embedding similarity.
-    Real impl: embed query_text → vector search → return trade records.
-    Stub returns empty list (no past setups in Phase 3).
-    """
+def _stub_query_rag(query_text: str, top_k: int = 5) -> list[dict]:
     print(f"[HydraDB STUB] query_rag top_k={top_k} → no past setups")
     return []
 
-
-def log_trade(trade_decision: dict, embedding: list[float] | None = None) -> str:
-    """Persist trade decision + embedding to HydraDB."""
+def _stub_log_trade(trade_decision: dict, embedding: list[float] | None = None) -> str:
     print(f"[HydraDB STUB] log_trade: {trade_decision}")
     return "trade_stub_id_001"
 
-
-def log_pass(reason: str, state_snapshot: dict) -> None:
-    """Log a skipped trade (low conviction / regime mismatch / hard gate)."""
+def _stub_log_pass(reason: str, state_snapshot: dict) -> None:
     print(f"[HydraDB STUB] log_pass reason={reason} ticker={state_snapshot.get('ticker')}")
 
-
-def update_trade_order_id(trade_id: str, order_id: str) -> None:
-    """Backfill Alpaca order_id onto an existing trade row in HydraDB."""
+def _stub_update_trade_order_id(trade_id: str, order_id: str) -> None:
     print(f"[HydraDB STUB] update_trade_order_id trade_id={trade_id} order_id={order_id}")
+
+
+# ── Real implementation ───────────────────────────────────────────────────
+
+if _LIVE:
+    import numpy as np
+    import requests as _requests
+
+    _HEADERS = {
+        "Authorization": f"Bearer {HYDRA_DB_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _source_id(prefix: str) -> str:
+        return f"{prefix}:{_now_iso()}:{uuid.uuid4()}"
+
+    def _request(method: str, path: str, json_body: dict = None) -> dict:
+        url = f"{HYDRA_DB_BASE_URL}{path}"
+        resp = _requests.request(method, url, headers=_HEADERS, json=json_body, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _wait_for(source_id: str, timeout: int = 40, interval: int = 3):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            data = _request("POST", "/fetch/content", {
+                "tenant_id": HYDRA_DB_TENANT_ID,
+                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                "source_id": source_id,
+                "mode": "content",
+            })
+            if data.get("success") and data.get("content"):
+                return data
+            time.sleep(interval)
+        raise TimeoutError(f"Timed out after {timeout}s waiting for {source_id}")
+
+    def _list_all_ids() -> list[dict]:
+        items = []
+        page = 1
+        while True:
+            data = _request("POST", "/list/data", {
+                "tenant_id": HYDRA_DB_TENANT_ID,
+                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                "kind": "memories",
+                "page": page,
+            })
+            batch = data.get("user_memories", [])
+            items.extend(batch)
+            if not data.get("pagination", {}).get("has_next"):
+                break
+            page += 1
+        return items
+
+    def _add_memory(text: str, source_id: str, title: str):
+        _request("POST", "/memories/add_memory", {
+            "memories": [{
+                "text": text,
+                "infer": False,
+                "is_markdown": False,
+                "source_id": source_id,
+                "title": title,
+            }],
+            "tenant_id": HYDRA_DB_TENANT_ID,
+            "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+            "upsert": True,
+        })
+
+    def get_latest_weights() -> dict:
+        items = _list_all_ids()
+        weight_ids = [m for m in items if m.get("memory_id", "").startswith("weights:")]
+        if not weight_ids:
+            return {}
+        weight_ids.sort(key=lambda x: x["memory_id"], reverse=True)
+        latest_id = weight_ids[0]["memory_id"]
+        data = _request("POST", "/fetch/content", {
+            "tenant_id": HYDRA_DB_TENANT_ID,
+            "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+            "source_id": latest_id,
+            "mode": "content",
+        })
+        return json.loads(data.get("content", "{}"))
+
+    def get_weights(ticker: str) -> dict:
+        weights = get_latest_weights()
+        if weights:
+            return weights
+        return {"w_sentiment": 0.4, "w_momentum": 0.35, "w_gamma": 0.25}
+
+    def get_agent_weights() -> dict:
+        weights = get_latest_weights()
+        if not weights:
+            return {"w_sentiment": 0.4, "w_momentum": 0.35, "w_gamma": 0.25}
+        return {k: weights.get(k) for k in ("w_sentiment", "w_momentum", "w_gamma")}
+
+    def log_trade(trade_decision: dict, embedding: list[float] | None = None) -> str:
+        sid = _source_id("trade")
+        uid = sid.split(":")[-1]
+        trade_decision["id"] = uid
+        trade_decision.setdefault("timestamp_entry", _now_iso())
+        if embedding is not None:
+            trade_decision["embedding"] = embedding
+        ticker = trade_decision.get("ticker", "UNKNOWN")
+        _add_memory(json.dumps(trade_decision), sid, f"trade {ticker}")
+        return sid
+
+    def log_pass(reason: str, state_snapshot: dict) -> None:
+        record = {
+            "type": "pass",
+            "reason": reason,
+            "state_snapshot": state_snapshot,
+            "timestamp": _now_iso(),
+        }
+        sid = _source_id("pass")
+        _add_memory(json.dumps(record), sid, f"pass — {reason}")
+
+    def update_trade_order_id(trade_id: str, order_id: str) -> None:
+        data = _wait_for(trade_id)
+        trade = json.loads(data["content"])
+        trade["alpaca_order_id"] = order_id
+        _add_memory(json.dumps(trade), trade_id, trade.get("ticker", "trade"))
+
+    def query_rag(query_text: str, top_k: int = 5) -> list[dict]:
+        from embedder import embed
+        emb = embed(query_text)
+        return _query_similar_setups(emb, top_k)
+
+    def _query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
+        items = _list_all_ids()
+        trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+        query = np.asarray(embedding_vector, dtype=np.float64)
+        scored = []
+        for tid in trade_ids:
+            data = _request("POST", "/fetch/content", {
+                "tenant_id": HYDRA_DB_TENANT_ID,
+                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                "source_id": tid,
+                "mode": "content",
+            })
+            if not data.get("content"):
+                continue
+            try:
+                rec = json.loads(data["content"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            outcome = rec.get("outcome")
+            stored_emb = rec.get("embedding")
+            if outcome is None or not isinstance(stored_emb, list):
+                continue
+            vec = np.asarray(stored_emb, dtype=np.float64)
+            if vec.ndim != 1 or query.ndim != 1 or vec.shape[0] != query.shape[0]:
+                continue
+            norm_q = np.linalg.norm(query)
+            norm_v = np.linalg.norm(vec)
+            if norm_q == 0.0 or norm_v == 0.0:
+                continue
+            similarity = float(np.dot(query, vec) / (norm_q * norm_v))
+            scored.append((similarity, rec, tid))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results = []
+        for sim, rec, tid in scored[:top_k]:
+            results.append({
+                "id": rec.get("id"),
+                "ticker": rec.get("ticker"),
+                "regime": rec.get("regime"),
+                "signals_json": rec.get("signals_json"),
+                "weights_json": rec.get("weights_json"),
+                "pnl_bps": rec.get("pnl_bps"),
+                "outcome": rec.get("outcome"),
+                "similarity": sim,
+            })
+        return results
+
+    def log_weights(w_sentiment: float, w_momentum: float, w_gamma: float,
+                    trigger: str, accuracy_json: dict):
+        sid = _source_id("weights")
+        record = {
+            "id": sid.split(":")[-1],
+            "timestamp": _now_iso(),
+            "w_sentiment": w_sentiment,
+            "w_momentum": w_momentum,
+            "w_gamma": w_gamma,
+            "trigger": trigger,
+            "accuracy_json": accuracy_json,
+        }
+        _add_memory(json.dumps(record), sid, "agent weights")
+
+    def get_recent_trades(n: int = 50) -> list[dict]:
+        items = _list_all_ids()
+        trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+        trade_ids.sort(reverse=True)
+        trade_ids = trade_ids[:n]
+        trades = []
+        for tid in trade_ids:
+            data = _request("POST", "/fetch/content", {
+                "tenant_id": HYDRA_DB_TENANT_ID,
+                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                "source_id": tid,
+                "mode": "content",
+            })
+            if data.get("content"):
+                trades.append(json.loads(data["content"]))
+        return trades
+
+    def update_trade_outcome(trade_id: str, pnl_bps: float, outcome: bool) -> None:
+        data = _wait_for(trade_id)
+        trade = json.loads(data["content"])
+        trade["pnl_bps"] = pnl_bps
+        trade["outcome"] = outcome
+        trade["timestamp_exit"] = _now_iso()
+        _add_memory(json.dumps(trade), trade_id, trade.get("ticker", "trade"))
+
+else:
+    get_weights = _stub_get_weights
+    get_agent_weights = _stub_get_agent_weights
+    query_rag = _stub_query_rag
+    log_trade = _stub_log_trade
+    log_pass = _stub_log_pass
+    update_trade_order_id = _stub_update_trade_order_id
+
+    def get_latest_weights() -> dict:
+        return {}
+
+    def log_weights(*args, **kwargs) -> None:
+        pass
+
+    def get_recent_trades(n: int = 50) -> list[dict]:
+        return []
+
+    def update_trade_outcome(trade_id: str, pnl_bps: float, outcome: bool) -> None:
+        pass
