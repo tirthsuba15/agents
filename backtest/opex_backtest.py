@@ -281,12 +281,13 @@ def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
         spy_closes[min(days)] = closes[max(days)]
     close_s = pd.Series(spy_closes).sort_index()
 
-    ma = close_s.rolling(TREND_LOOKBACK, min_periods=1).mean().shift(1)
-    prior_close = close_s.shift(1)
-    uptrend = (prior_close > ma).reindex(spy_rets.index, fill_value=True)
-    prior_ret = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
+    prior_close  = close_s.shift(1)
+    rolling_high = close_s.rolling(52, min_periods=26).max().shift(1)
+    near_high    = (prior_close / rolling_high) > 0.92   # within 8% of 52wk high
+    near_high    = near_high.reindex(spy_rets.index, fill_value=True)
+    prior_ret    = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
 
-    return pd.DataFrame({"uptrend": uptrend, "prior_ret": prior_ret})
+    return pd.DataFrame({"near_high": near_high, "prior_ret": prior_ret})
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +344,7 @@ def label_weeks(
             opex = False
 
         # Regime filter
-        uptrend  = bool(spy_signals.loc[ws, "uptrend"]) if ws in spy_signals.index else True
+        uptrend  = bool(spy_signals.loc[ws, "near_high"]) if ws in spy_signals.index else True
         prior_ret = float(spy_signals.loc[ws, "prior_ret"]) if ws in spy_signals.index else 0.0
         smart = opex and uptrend and prior_ret > MOMENTUM_FLOOR
 
@@ -453,7 +454,7 @@ def main() -> None:
     print("OPEX Backtest v3 - 21-Stock Large-Cap Basket")
     print(f"Basket : {BASKET}")
     print(f"Period : {START_DATE} to {END_DATE}")
-    print(f"Filter : SPY {TREND_LOOKBACK}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
+    print(f"Filter : SPY within 8% of 52-week high (adaptive trend) + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
 
     print("Loading macro gate dates...")
     blocked = fetch_blocked_dates()

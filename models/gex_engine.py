@@ -37,6 +37,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.fred_client import get_risk_free_rate
 
 # ---------------------------------------------------------------------------
+# #11 — 15-minute options chain cache
+# ---------------------------------------------------------------------------
+_chain_cache: dict = {}   # {symbol: (fetched_at, chain)}
+_CACHE_TTL = 900          # 15 minutes in seconds
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
@@ -118,15 +124,20 @@ def compute_gex(
 
         call_iv = opt.get("call_iv", 0.0)
         call_oi = opt.get("call_oi", 0)
+        put_iv  = opt.get("put_iv", 0.0)
+        put_oi  = opt.get("put_oi", 0)
+        call_vol = opt.get("call_volume", 0)
+        put_vol  = opt.get("put_volume",  0)
+        call_oi_eff = call_oi * (1 + call_vol / max(call_oi, 1))
+        put_oi_eff  = put_oi  * (1 + put_vol  / max(put_oi,  1))
+
         if call_iv >= MIN_IV and call_oi > 0:
             g = bs_gamma(spot_price, K, T, risk_free_rate, div_yield, call_iv)
-            total += g * call_oi * 100 * spot_price ** 2 * 0.01
+            total += g * call_oi_eff * 100 * spot_price ** 2 * 0.01
 
-        put_iv = opt.get("put_iv", 0.0)
-        put_oi = opt.get("put_oi", 0)
         if put_iv >= MIN_IV and put_oi > 0:
             g = bs_gamma(spot_price, K, T, risk_free_rate, div_yield, put_iv)
-            total -= g * put_oi * 100 * spot_price ** 2 * 0.01
+            total -= g * put_oi_eff * 100 * spot_price ** 2 * 0.01
 
     return total
 
@@ -218,15 +229,19 @@ def compute_vanna_charm(
 
             return vanna * oi * 100, charm * oi * 100
 
-        call_iv = opt.get("call_iv", 0.0)
-        call_oi = opt.get("call_oi", 0)
-        v, c = _greek_contrib(call_iv, call_oi, is_put=False)
+        call_iv  = opt.get("call_iv", 0.0)
+        call_oi  = opt.get("call_oi", 0)
+        call_vol = opt.get("call_volume", 0)
+        call_oi_eff = call_oi * (1 + call_vol / max(call_oi, 1))
+        v, c = _greek_contrib(call_iv, call_oi_eff, is_put=False)
         net_vanna += v
         net_charm += c
 
-        put_iv = opt.get("put_iv", 0.0)
-        put_oi = opt.get("put_oi", 0)
-        v, c = _greek_contrib(put_iv, put_oi, is_put=True)
+        put_iv  = opt.get("put_iv", 0.0)
+        put_oi  = opt.get("put_oi", 0)
+        put_vol = opt.get("put_volume", 0)
+        put_oi_eff = put_oi * (1 + put_vol / max(put_oi, 1))
+        v, c = _greek_contrib(put_iv, put_oi_eff, is_put=True)
         net_vanna -= v   # puts negative
         net_charm -= c
 
@@ -255,21 +270,59 @@ def compute_delta_exposure(
             continue
         K = opt["strike"]
 
-        call_iv = opt.get("call_iv", 0.0)
-        call_oi = opt.get("call_oi", 0)
+        call_iv  = opt.get("call_iv", 0.0)
+        call_oi  = opt.get("call_oi", 0)
+        call_vol = opt.get("call_volume", 0)
+        call_oi_eff = call_oi * (1 + call_vol / max(call_oi, 1))
         if call_iv >= MIN_IV and call_oi > 0:
             d1, _ = _d1_d2(spot_price, K, T, r, q, call_iv)
             call_delta = math.exp(-q * T) * norm.cdf(d1)
-            total += call_delta * call_oi * 100 * spot_price
+            total += call_delta * call_oi_eff * 100 * spot_price
 
-        put_iv = opt.get("put_iv", 0.0)
-        put_oi = opt.get("put_oi", 0)
+        put_iv  = opt.get("put_iv", 0.0)
+        put_oi  = opt.get("put_oi", 0)
+        put_vol = opt.get("put_volume", 0)
+        put_oi_eff = put_oi * (1 + put_vol / max(put_oi, 1))
         if put_iv >= MIN_IV and put_oi > 0:
             d1, _ = _d1_d2(spot_price, K, T, r, q, put_iv)
             put_delta = math.exp(-q * T) * (norm.cdf(d1) - 1)
-            total += put_delta * put_oi * 100 * spot_price
+            total += put_delta * put_oi_eff * 100 * spot_price
 
     return total
+
+
+# ---------------------------------------------------------------------------
+# #9 — GEX by strike chart
+# ---------------------------------------------------------------------------
+
+def plot_gex_by_strike(chain, spot, r, q, symbol, out_path=None):
+    import matplotlib.pyplot as plt
+
+    strikes, gex_vals = [], []
+    for opt in chain:
+        T = _tte(opt["expiry"])
+        if T <= 0: continue
+        K = opt["strike"]
+        call_g = bs_gamma(spot, K, T, r, q, opt.get("call_iv", 0))
+        put_g  = bs_gamma(spot, K, T, r, q, opt.get("put_iv",  0))
+        net    = (call_g * opt.get("call_oi", 0) - put_g * opt.get("put_oi", 0)) * 100 * spot**2 * 0.01
+        strikes.append(K)
+        gex_vals.append(net / 1e6)   # in $M
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in gex_vals]
+    ax.bar(strikes, gex_vals, color=colors, width=(max(strikes)-min(strikes))/len(strikes)*0.8)
+    ax.axvline(spot, color="#2980b9", linewidth=1.5, linestyle="--", label=f"Spot ${spot:.0f}")
+    ax.axhline(0,    color="#7f8c8d", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("Strike")
+    ax.set_ylabel("Net GEX ($M)")
+    ax.set_title(f"{symbol} — GEX by Strike")
+    ax.legend()
+    plt.tight_layout()
+    path = out_path or Path(f"backtest/gex_by_strike_{symbol}.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Chart saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +401,16 @@ def fetch_options_chain(symbol: str) -> OptionsChain:
     """
     Try Finnhub first; fall back to yfinance if key missing or 403.
     Returns normalised OptionsChain (max MAX_DTE days to expiry).
+    Caches results for _CACHE_TTL seconds (#11).
     """
+    import time
+    cached = _chain_cache.get(symbol)
+    if cached:
+        fetched_at, chain = cached
+        if time.time() - fetched_at < _CACHE_TTL:
+            print(f"  Options source: cache ({len(chain)} strike rows)")
+            return chain
+
     today = datetime.date.today()
 
     if FINNHUB_API_KEY:
@@ -362,6 +424,7 @@ def fetch_options_chain(symbol: str) -> OptionsChain:
             chain = _parse_finnhub(r.json().get("data", []), today)
             if chain:
                 print(f"  Options source: Finnhub ({len(chain)} strike rows)")
+                _chain_cache[symbol] = (time.time(), chain)
                 return chain
             print("  Finnhub returned empty chain — falling back to yfinance")
         except requests.RequestException as exc:
@@ -370,6 +433,7 @@ def fetch_options_chain(symbol: str) -> OptionsChain:
     ticker = yf.Ticker(symbol)
     chain  = _parse_yfinance(ticker, today)
     print(f"  Options source: yfinance ({len(chain)} strike rows)")
+    _chain_cache[symbol] = (time.time(), chain)
     return chain
 
 
@@ -412,6 +476,7 @@ def main(symbol: str) -> None:
     regime   = get_gex_regime(net_gex, spot, flip)
     vc       = compute_vanna_charm(chain, spot, r, q)
     net_dex  = compute_delta_exposure(chain, spot, r, q)
+    plot_gex_by_strike(chain, spot, r, q, symbol)
 
     print(f"\n{'-'*45}")
     print(f"  Net GEX          : ${net_gex:>15,.0f}")
