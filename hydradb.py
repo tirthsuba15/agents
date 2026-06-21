@@ -49,3 +49,8 @@ def log_trade(trade_decision: dict, embedding: list[float] | None = None) -> str
 def log_pass(reason: str, state_snapshot: dict) -> None:
     """Log a skipped trade (low conviction / regime mismatch / hard gate)."""
     print(f"[HydraDB STUB] log_pass reason={reason} ticker={state_snapshot.get('ticker')}")
+
+
+def update_trade_order_id(trade_id: str, order_id: str) -> None:
+    """Backfill Alpaca order_id onto an existing trade row in HydraDB."""
+    print(f"[HydraDB STUB] update_trade_order_id trade_id={trade_id} order_id={order_id}")
