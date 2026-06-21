@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+Gamma Model — Phase 4
+=====================
+Composite options-flow signal combining IV spread, volatility smirk,
+put-call ratio, and GEX regime into a cross-sectional ranked score.
+
+Formula (no ML needed for initial version):
+  composite = 0.4 * (-pcr_rank) + 0.3 * iv_spread_rank + 0.3 * (-smirk_rank)
+  where _rank = percentile rank across universe (0 to 1)
+
+XGBoost regressor is trained IF a historical feature dataset is provided
+(historical options snapshots are a paid data product). Falls back to the
+weighted formula otherwise.
+
+Features (per ticker):
+  iv_spread      — OI-weighted mean(call_IV - put_IV) across matched pairs
+  smirk          — IV(25-delta put) - IV(50-delta call)
+  pcr            — sum(put_volume) / sum(call_volume)
+  gex_regime_flag— +1 positive_gamma, -1 negative_gamma
+  vix_level      — current VIX
+
+Output: SignalObject with direction in [-1, +1] and conviction in [0, 1].
+
+Usage (acceptance test):
+  python models/gamma_model.py NVDA
+  python models/gamma_model.py NVDA AAPL MSFT SPY   (custom universe)
+"""
+
+import calendar
+import datetime
+import json
+import math
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import yfinance as yf
+from scipy.stats import norm, rankdata
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from data.fred_client import get_risk_free_rate
+from models.gex_engine import (
+    fetch_options_chain,
+    fetch_spot_and_div,
+    compute_gex,
+    find_zero_gamma_flip,
+    get_gex_regime,
+)
+
+MIN_IV      = 0.01
+MODEL_PATH  = Path(__file__).parent / "gamma_model.pkl"
+
+# Default cross-sectional universe used when running the acceptance test
+DEFAULT_UNIVERSE = ["NVDA", "AAPL", "MSFT", "SPY"]
+
+
+# ---------------------------------------------------------------------------
+# Time helper (local copy — avoids importing private _tte)
+# ---------------------------------------------------------------------------
+
+def _tte(expiry: datetime.date) -> float:
+    return max((expiry - datetime.date.today()).days / 365.25, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Black-Scholes delta (needed for smirk strike selection)
+# ---------------------------------------------------------------------------
+
+def _d1(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    return (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+
+
+def bs_call_delta(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    if T <= 0 or sigma < MIN_IV:
+        return 0.0
+    return math.exp(-q * T) * norm.cdf(_d1(S, K, T, r, q, sigma))
+
+
+def bs_put_delta(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    if T <= 0 or sigma < MIN_IV:
+        return 0.0
+    return math.exp(-q * T) * (norm.cdf(_d1(S, K, T, r, q, sigma)) - 1)
+
+
+# ---------------------------------------------------------------------------
+# Feature computation
+# ---------------------------------------------------------------------------
+
+def compute_iv_spread(chain: list) -> float:
+    """
+    OI-weighted mean of (call_IV - put_IV) across all matched (expiry, strike) pairs.
+    Positive value = calls more expensive than puts (bullish skew).
+    """
+    num, denom = 0.0, 0.0
+    for opt in chain:
+        T = _tte(opt["expiry"])
+        if T <= 0:
+            continue
+        civ, piv   = opt.get("call_iv", 0.0), opt.get("put_iv", 0.0)
+        coi, poi   = opt.get("call_oi", 0),   opt.get("put_oi", 0)
+        if civ >= MIN_IV and piv >= MIN_IV:
+            weight  = float(coi + poi)
+            num    += (civ - piv) * weight
+            denom  += weight
+    return num / denom if denom > 0 else 0.0
+
+
+def compute_smirk(chain: list, spot: float, r: float, q: float) -> float:
+    """
+    Volatility smirk = IV(25-delta put) - IV(50-delta call).
+    Finds the put option whose delta is closest to -0.25 and the call
+    whose delta is closest to +0.50, looking across all expiries.
+    Positive smirk = put skew premium exists (fear is priced in).
+    """
+    put_candidates:  list[tuple] = []   # (|delta_diff|, iv)
+    call_candidates: list[tuple] = []
+
+    for opt in chain:
+        T = _tte(opt["expiry"])
+        if T <= 0:
+            continue
+        K = opt["strike"]
+
+        piv = opt.get("put_iv", 0.0)
+        if piv >= MIN_IV:
+            d = bs_put_delta(spot, K, T, r, q, piv)
+            put_candidates.append((abs(d - (-0.25)), piv))
+
+        civ = opt.get("call_iv", 0.0)
+        if civ >= MIN_IV:
+            d = bs_call_delta(spot, K, T, r, q, civ)
+            call_candidates.append((abs(d - 0.50), civ))
+
+    if not put_candidates or not call_candidates:
+        return 0.0
+
+    _, put_iv  = min(put_candidates,  key=lambda x: x[0])
+    _, call_iv = min(call_candidates, key=lambda x: x[0])
+    return put_iv - call_iv
+
+
+def compute_pcr(chain: list) -> float:
+    """
+    Put-call ratio = sum(put_volume) / sum(call_volume).
+    PCR > 1 = more puts traded (bearish sentiment).
+    PCR < 1 = more calls traded (bullish sentiment).
+    """
+    total_put_vol  = sum(opt.get("put_volume",  0) for opt in chain)
+    total_call_vol = sum(opt.get("call_volume", 0) for opt in chain)
+    if total_call_vol == 0:
+        return 1.0   # neutral default
+    return total_put_vol / total_call_vol
+
+
+def compute_gex_regime_flag(chain: list, spot: float, r: float, q: float) -> int:
+    """Returns +1 for positive_gamma regime, -1 for negative_gamma."""
+    net_gex = compute_gex(chain, spot, r, q)
+    flip    = find_zero_gamma_flip(chain, spot, r, q)
+    regime  = get_gex_regime(net_gex, spot, flip)
+    return 1 if regime == "positive_gamma" else -1
+
+
+def get_vix() -> float:
+    try:
+        bars = yf.Ticker("^VIX").history(period="2d", auto_adjust=True)
+        return float(bars["Close"].iloc[-1]) if not bars.empty else 20.0
+    except Exception:
+        return 20.0
+
+
+# ---------------------------------------------------------------------------
+# Full feature dict for one ticker
+# ---------------------------------------------------------------------------
+
+def compute_gamma_features(
+    symbol: str,
+    r: float,
+    vix: float,
+) -> dict | None:
+    """
+    Returns dict with all 5 features, or None if options chain is unavailable.
+    """
+    try:
+        spot, q = fetch_spot_and_div(symbol)
+        if spot <= 0:
+            return None
+        chain = fetch_options_chain(symbol)
+        if not chain:
+            return None
+
+        iv_spread       = compute_iv_spread(chain)
+        smirk           = compute_smirk(chain, spot, r, q)
+        pcr             = compute_pcr(chain)
+        gex_regime_flag = compute_gex_regime_flag(chain, spot, r, q)
+
+        return {
+            "symbol":          symbol,
+            "spot":            spot,
+            "iv_spread":       iv_spread,
+            "smirk":           smirk,
+            "pcr":             pcr,
+            "gex_regime_flag": gex_regime_flag,
+            "vix_level":       vix,
+        }
+    except Exception as exc:
+        print(f"    {symbol}: skipped ({exc})")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cross-sectional ranking and composite score
+# ---------------------------------------------------------------------------
+
+def _rank01(values: np.ndarray) -> np.ndarray:
+    """Percentile rank normalised to [0, 1]. Ties use average rank."""
+    if len(values) == 1:
+        return np.array([0.5])
+    r = rankdata(values)          # 1 to n
+    return (r - 1) / (len(r) - 1)  # 0 to 1
+
+
+def compute_composite_scores(feature_rows: list[dict]) -> list[dict]:
+    """
+    composite = 0.4 * (-pcr_rank) + 0.3 * iv_spread_rank + 0.3 * (-smirk_rank)
+
+    Then normalise composite itself across the universe to [-1, +1] via
+    min-max centred at 0: direction = 2*(score - min)/(max - min) - 1
+    """
+    iv_spreads = np.array([f["iv_spread"] for f in feature_rows])
+    smirks     = np.array([f["smirk"]     for f in feature_rows])
+    pcrs       = np.array([f["pcr"]       for f in feature_rows])
+
+    iv_rank  = _rank01(iv_spreads)
+    smirk_rk = _rank01(smirks)
+    pcr_rk   = _rank01(pcrs)
+
+    raw = 0.4 * (-pcr_rk) + 0.3 * iv_rank + 0.3 * (-smirk_rk)
+
+    # Normalise to [-1, +1]
+    lo, hi = raw.min(), raw.max()
+    if hi > lo:
+        direction = 2 * (raw - lo) / (hi - lo) - 1
+    else:
+        direction = np.zeros_like(raw)
+
+    results = []
+    for i, feat in enumerate(feature_rows):
+        d = float(direction[i])
+        results.append({
+            **feat,
+            "raw_composite":  float(raw[i]),
+            "direction":      round(d, 4),
+            "conviction":     round(abs(d), 4),
+            "iv_spread_rank": round(float(iv_rank[i]),  4),
+            "smirk_rank":     round(float(smirk_rk[i]), 4),
+            "pcr_rank":       round(float(pcr_rk[i]),   4),
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# XGBoost path (future — needs historical options snapshots)
+# ---------------------------------------------------------------------------
+
+def _try_load_xgb_model():
+    """Load trained XGBoost regressor if available."""
+    if MODEL_PATH.exists():
+        import joblib
+        payload = joblib.load(MODEL_PATH)
+        return payload.get("model")
+    return None
+
+
+def train_gamma_model(historical_data: list[dict]) -> None:
+    """
+    Train XGBoost regressor on historical weekly options features.
+
+    historical_data: list of dicts, each with keys:
+        iv_spread, smirk, pcr, gex_regime_flag, vix_level, label
+    where label = +1 if stock outperformed SPY that week, -1 otherwise.
+
+    This function is a stub — it requires historical options snapshots
+    (paid data product). See OPTIMIZATIONS.md item #7.
+    """
+    if len(historical_data) < 50:
+        print("Insufficient historical data for XGBoost training.")
+        print("Need weekly options snapshots — see OPTIMIZATIONS.md item #7.")
+        print("Using formula-based signal instead.")
+        return
+
+    import joblib
+    import pandas as pd
+    from xgboost import XGBRegressor
+
+    FEAT = ["iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level"]
+    df   = pd.DataFrame(historical_data).dropna()
+    X    = df[FEAT].values
+    y    = df["label"].values.astype(float)
+
+    split  = int(len(df) * 0.70)
+    model  = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
+                          random_state=42, n_jobs=-1)
+    model.fit(X[:split], y[:split], eval_set=[(X[split:], y[split:])], verbose=False)
+
+    corr = float(np.corrcoef(model.predict(X[split:]), y[split:])[0, 1])
+    print(f"  IC (Pearson correlation): {corr:.4f}")
+
+    joblib.dump({"model": model, "feature_names": FEAT}, MODEL_PATH)
+    print(f"  Saved: {MODEL_PATH}")
+
+
+# ---------------------------------------------------------------------------
+# Main predict function
+# ---------------------------------------------------------------------------
+
+def predict_gamma(target: str, universe: list[str] | None = None) -> dict:
+    """
+    Compute gamma-flow signal for `target` ranked within `universe`.
+    Falls back to formula (XGBoost used only if pkl exists).
+    """
+    if universe is None:
+        universe = list(dict.fromkeys([target] + DEFAULT_UNIVERSE))
+    elif target not in universe:
+        universe = [target] + list(universe)
+
+    r   = get_risk_free_rate()
+    vix = get_vix()
+
+    print(f"  Risk-free rate : {r*100:.3f}%  |  VIX : {vix:.1f}")
+    print(f"  Universe       : {universe}")
+    print(f"  Computing features...")
+
+    feature_rows = []
+    for sym in universe:
+        print(f"    {sym}...", end=" ", flush=True)
+        feat = compute_gamma_features(sym, r, vix)
+        if feat:
+            feature_rows.append(feat)
+            print(f"iv_spread={feat['iv_spread']:+.4f}  "
+                  f"smirk={feat['smirk']:+.4f}  "
+                  f"pcr={feat['pcr']:.3f}  "
+                  f"gex={'POS' if feat['gex_regime_flag']==1 else 'NEG'}")
+        else:
+            print("no data")
+
+    if not feature_rows:
+        raise RuntimeError("No feature data available for any symbol in universe")
+
+    target_row = next((f for f in feature_rows if f["symbol"] == target), None)
+    if target_row is None:
+        raise RuntimeError(f"{target} options chain unavailable")
+
+    # Try XGBoost first; fall back to formula
+    xgb = _try_load_xgb_model()
+    if xgb:
+        FEAT = ["iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level"]
+        vec  = np.array([[target_row[f] for f in FEAT]])
+        raw  = float(xgb.predict(vec)[0])
+        direction  = round(float(np.clip(raw, -1, 1)), 4)
+        conviction = round(abs(direction), 4)
+        method     = "xgboost_regressor"
+    else:
+        scored = compute_composite_scores(feature_rows)
+        result = next(s for s in scored if s["symbol"] == target)
+        direction  = result["direction"]
+        conviction = result["conviction"]
+        method     = "weighted_formula"
+
+    return {
+        "model":      f"gamma_{method}_v1",
+        "timestamp":  datetime.datetime.now().isoformat(timespec="seconds"),
+        "symbol":     target,
+        "direction":  direction,
+        "conviction": conviction,
+        "signals": {
+            "iv_spread":       round(target_row["iv_spread"],       6),
+            "smirk":           round(target_row["smirk"],           6),
+            "pcr":             round(target_row["pcr"],             4),
+            "gex_regime":      "positive_gamma" if target_row["gex_regime_flag"] == 1
+                               else "negative_gamma",
+            "vix_level":       round(target_row["vix_level"],       2),
+        },
+        "universe_size": len(feature_rows),
+        "method":     method,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI — acceptance test
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    target   = sys.argv[1].upper() if len(sys.argv) > 1 else "NVDA"
+    # Additional args after the target define a custom universe
+    # If only the target is given, DEFAULT_UNIVERSE is used for cross-sectional ranking
+    universe = [a.upper() for a in sys.argv[2:]] if len(sys.argv) > 2 else None
+
+    print(f"\nGamma Model — {target}")
+    print("=" * 50)
+
+    signal = predict_gamma(target, universe)
+
+    print("\nSignalObject:")
+    print(json.dumps(signal, indent=2))
+
+
+if __name__ == "__main__":
+    main()

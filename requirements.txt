@@ -1,3 +1,18 @@
+# Person B (memory/RAG)
 requests
 numpy
 sentence-transformers
+# Person A (agents / graph / execution)
+langgraph
+openai
+alpaca-py
+finnhub-python
+python-dotenv
+# Person C (models / backtest)
+xgboost
+scikit-learn
+joblib
+pandas
+scipy
+yfinance
+matplotlib
