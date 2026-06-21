@@ -3,6 +3,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import numpy as np
 import requests
 
 from config import HYDRA_DB_API_KEY, HYDRA_DB_BASE_URL, HYDRA_DB_TENANT_ID, HYDRA_DB_SUB_TENANT_ID
@@ -189,6 +190,60 @@ def get_recent_trades(n: int = 50) -> list[dict]:
     return trades
 
 
+def query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
+    items = _list_all_ids()
+    trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+
+    query = np.asarray(embedding_vector, dtype=np.float64)
+    scored = []
+
+    for tid in trade_ids:
+        data = _request("POST", "/fetch/content", {
+            "tenant_id": HYDRA_DB_TENANT_ID,
+            "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+            "source_id": tid,
+            "mode": "content",
+        })
+        if not data.get("content"):
+            continue
+        try:
+            rec = json.loads(data["content"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        outcome = rec.get("outcome")
+        stored_emb = rec.get("embedding")
+        if outcome is None or not isinstance(stored_emb, list):
+            continue
+        vec = np.asarray(stored_emb, dtype=np.float64)
+        if vec.ndim != 1 or query.ndim != 1:
+            continue
+        if vec.shape[0] != query.shape[0]:
+            continue
+        norm_q = np.linalg.norm(query)
+        norm_v = np.linalg.norm(vec)
+        if norm_q == 0.0 or norm_v == 0.0:
+            continue
+        similarity = float(np.dot(query, vec) / (norm_q * norm_v))
+        scored.append((similarity, rec, tid))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    scored = scored[:top_k]
+
+    results = []
+    for sim, rec, tid in scored:
+        results.append({
+            "id": rec.get("id"),
+            "ticker": rec.get("ticker"),
+            "regime": rec.get("regime"),
+            "signals_json": rec.get("signals_json"),
+            "weights_json": rec.get("weights_json"),
+            "pnl_bps": rec.get("pnl_bps"),
+            "outcome": rec.get("outcome"),
+            "similarity": sim,
+        })
+    return results
+
+
 if __name__ == "__main__":
     failures = []
 
@@ -294,6 +349,64 @@ if __name__ == "__main__":
                   f"ids: {ids}")
         except Exception as e:
             check("test trade in recent trades", False, str(e))
+
+    print()
+    print("--- QUERY_SIMILAR_SETUPS ACCEPTANCE TEST ---")
+    try:
+        n_dim = 384
+        def _vec_1hot(pos, dims=n_dim):
+            v = [0.0] * dims
+            v[pos] = 1.0
+            return v
+
+        trade1 = {
+            "ticker": "SIMQ1", "regime": "bull", "pnl_bps": 100, "outcome": True,
+            "signals_json": json.dumps({"ema": True}), "weights_json": json.dumps({"w": 0.5}),
+        }
+        trade2 = {
+            "ticker": "SIMQ2", "regime": "bear", "pnl_bps": -50, "outcome": False,
+            "signals_json": json.dumps({"rsi": True}), "weights_json": json.dumps({"w": 0.3}),
+        }
+        trade3 = {
+            "ticker": "SIMQ3", "regime": "range", "pnl_bps": 25, "outcome": True,
+            "signals_json": json.dumps({"volume": True}), "weights_json": json.dumps({"w": 0.7}),
+        }
+
+        V2 = _vec_1hot(1)
+        sid_a = log_trade(trade1, embedding=_vec_1hot(0))
+        sid_b = log_trade(trade2, embedding=V2)
+        sid_c = log_trade(trade3, embedding=_vec_1hot(2))
+        print(f"  inserted trades: {sid_a}, {sid_b}, {sid_c}")
+
+        for sid in (sid_a, sid_b, sid_c):
+            _wait_for(sid)
+        print("  all 3 trades confirmed ingested")
+
+        results = query_similar_setups(V2, top_k=3)
+        n_res = len(results)
+        check("query returned 3 results", n_res == 3, f"got {n_res}")
+        if n_res >= 2:
+            descending = all(results[i]["similarity"] >= results[i+1]["similarity"]
+                           for i in range(n_res - 1))
+            check("similarities are descending", descending,
+                  f"sims: {[r['similarity'] for r in results]}")
+        if n_res >= 1:
+            check("top result is trade #2 (SIMQ2)", results[0]["ticker"] == "SIMQ2",
+                  f"got {results[0]['ticker']} sim={results[0]['similarity']:.6f}")
+        for r in results:
+            needed = {"id", "ticker", "regime", "signals_json", "weights_json",
+                      "pnl_bps", "outcome", "similarity"}
+            actual = set(r.keys())
+            check(f"result keys match spec", actual == needed,
+                  f"extra: {actual-needed}, missing: {needed-actual}")
+
+        for r in results:
+            print(f"  {r['ticker']:8s}  sim={r['similarity']:.6f}  "
+                  f"outcome={r['outcome']}  regime={r['regime']}")
+    except Exception as e:
+        import traceback
+        check("query_similar_setups acceptance test", False,
+              f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     print()
     print("--- CONTRACT SMOKE TEST ---")
