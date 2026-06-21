@@ -57,6 +57,8 @@ MODEL_PATH  = Path(__file__).parent / "gamma_model.pkl"
 FEATURE_NAMES = [
     "iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level",
     "mom4w", "rsi14", "hpr52", "gex_x_vix", "macro_flag",
+    "rv_iv_ratio", "term_slope",              # #26: real IV surface features
+    "mom1w", "macd_hist", "mom8w", "mom13w",  # tech momentum + LOW
 ]
 
 # Default cross-sectional universe used when running the acceptance test
@@ -247,24 +249,44 @@ def get_vix() -> float:
 # ---------------------------------------------------------------------------
 
 def _get_price_factors(symbol: str) -> dict:
-    """Compute mom4w, rsi14, hpr52, gex_x_vix from the last ~400 days of daily closes."""
-    defaults = {"mom4w": 0.0, "rsi14": 50.0, "hpr52": 1.0, "gex_x_vix": 0.0}
+    """Compute price-based features from the last ~400 days of daily closes."""
+    defaults = {
+        "mom4w": 0.0, "rsi14": 50.0, "hpr52": 1.0, "gex_x_vix": 0.0,
+        "mom1w": 0.0, "macd_hist": 0.0, "mom8w": 0.0, "mom13w": 0.0,
+    }
     try:
         bars  = yf.Ticker(symbol).history(period="400d", auto_adjust=True)
         if bars.empty or len(bars) < 30:
             return defaults
         close = bars["Close"]
+
         mom4w = float(close.iloc[-1] / close.iloc[-20] - 1) if len(close) >= 20 else 0.0
+        mom1w = float(close.iloc[-1] / close.iloc[-5]  - 1) if len(close) >= 5  else 0.0
+        mom8w = float(close.iloc[-1] / close.iloc[-40] - 1) if len(close) >= 40 else 0.0
+        mom13w = float(close.iloc[-1] / close.iloc[-65] - 1) if len(close) >= 65 else 0.0
+
         delta = close.diff()
         gain  = float(delta.clip(lower=0).rolling(14).mean().iloc[-1])
         loss  = float((-delta.clip(upper=0)).rolling(14).mean().iloc[-1])
         rsi14 = 100 - (100 / (1 + gain / loss)) if loss > 0 else 100.0
+
         hpr52 = float(close.iloc[-1] / close.rolling(252).max().iloc[-1]) if len(close) >= 252 else 1.0
-        # gex_x_vix: sign(close - SMA20) * HV10
+
         sma20     = float(close.rolling(20).mean().iloc[-1])
         hv10_val  = float(np.log(close / close.shift(1)).rolling(10).std().iloc[-1] * np.sqrt(252))
         gex_x_vix = float(np.sign(close.iloc[-1] - sma20)) * hv10_val
-        return {"mom4w": mom4w, "rsi14": rsi14, "hpr52": hpr52, "gex_x_vix": gex_x_vix}
+
+        # MACD histogram: (EMA12 - EMA26) - EMA9_of_that
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line   = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist   = float((macd_line - signal_line).iloc[-1])
+
+        return {
+            "mom4w": mom4w, "rsi14": rsi14, "hpr52": hpr52, "gex_x_vix": gex_x_vix,
+            "mom1w": mom1w, "macd_hist": macd_hist, "mom8w": mom8w, "mom13w": mom13w,
+        }
     except Exception:
         return defaults
 
@@ -272,6 +294,60 @@ def _get_price_factors(symbol: str) -> dict:
 # ---------------------------------------------------------------------------
 # Full feature dict for one ticker
 # ---------------------------------------------------------------------------
+
+def _compute_rv_iv_ratio(chain: list, symbol: str, vix: float) -> float:
+    """
+    #26 — Realized/implied vol ratio: HV20 / ATM_IV.
+    ATM IV = average IV of all options within 5% of current spot.
+    Falls back to HV20/VIX if no ATM options available.
+    """
+    try:
+        bars  = yf.Ticker(symbol).history(period="60d", auto_adjust=True)
+        close = bars["Close"]
+        hv20  = float(np.log(close / close.shift(1)).rolling(20).std().iloc[-1] * np.sqrt(252))
+        if np.isnan(hv20):
+            return 1.0
+
+        spot = float(close.iloc[-1])
+        atm_ivs = []
+        for opt in chain:
+            if abs(opt["strike"] / spot - 1) < 0.05:
+                if opt.get("call_iv", 0.0) >= MIN_IV:
+                    atm_ivs.append(opt["call_iv"])
+                if opt.get("put_iv",  0.0) >= MIN_IV:
+                    atm_ivs.append(opt["put_iv"])
+
+        atm_iv = float(np.mean(atm_ivs)) if atm_ivs else (vix / 100)
+        return round(hv20 / atm_iv if atm_iv > 0 else 1.0, 4)
+    except Exception:
+        return 1.0
+
+
+def _compute_term_slope(chain: list, vix: float) -> float:
+    """
+    #26 — IV term structure slope: near-expiry IV minus far-expiry IV.
+    Near = expiries ≤30 days, Far = expiries 60-120 days.
+    Positive = inverted term structure (stress / near vol elevated).
+    Falls back to 0.0 if either bucket is empty.
+    """
+    today     = datetime.date.today()
+    near_ivs  = []
+    far_ivs   = []
+    for opt in chain:
+        days = (opt["expiry"] - today).days
+        civs = opt.get("call_iv", 0.0)
+        pivs = opt.get("put_iv",  0.0)
+        if days <= 30:
+            if civs >= MIN_IV: near_ivs.append(civs)
+            if pivs >= MIN_IV: near_ivs.append(pivs)
+        elif 60 <= days <= 120:
+            if civs >= MIN_IV: far_ivs.append(civs)
+            if pivs >= MIN_IV: far_ivs.append(pivs)
+
+    near_iv = float(np.mean(near_ivs)) if near_ivs else (vix / 100)
+    far_iv  = float(np.mean(far_ivs))  if far_ivs  else (vix / 100)
+    return round(near_iv - far_iv, 4)
+
 
 def compute_gamma_features(
     symbol: str,
@@ -295,6 +371,8 @@ def compute_gamma_features(
         gex_regime_flag = compute_gex_regime_flag(chain, spot, r, q)
         price_factors   = _get_price_factors(symbol)
         macro_flag      = is_macro_week(datetime.date.today())
+        rv_iv_ratio     = _compute_rv_iv_ratio(chain, symbol, vix)
+        term_slope      = _compute_term_slope(chain, vix)
 
         return {
             "symbol":          symbol,
@@ -305,6 +383,8 @@ def compute_gamma_features(
             "gex_regime_flag": gex_regime_flag,
             "vix_level":       vix,
             "macro_flag":      macro_flag,
+            "rv_iv_ratio":     rv_iv_ratio,
+            "term_slope":      term_slope,
             **price_factors,
         }
     except Exception as exc:

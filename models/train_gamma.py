@@ -19,6 +19,14 @@ pkl loads transparently into gamma_model.py inference):
   rsi14           <- 14-week RSI                (overbought / oversold)
   hpr52           <- close / 52wk-high          (breakout proximity)
   macro_flag      <- 1 if date is within 3 days of FOMC/CPI/NFP event
+  rv_iv_ratio     <- HV20 / (VIX/100)          (#26: realized/implied vol ratio proxy)
+  term_slope      <- HV5 - HV20                (#26: IV term structure slope proxy)
+  mom1w           <- 1-week price return        (r5d momentum, tech signal)
+  macd_hist       <- MACD(12,26,9) histogram   (trend momentum, tech signal)
+  mom8w           <- 8-week price return        (medium-term momentum)
+  mom13w          <- 13-week price return       (medium-term momentum)
+
+Tech sector uses TECH_FEATURE_NAMES (momentum-focused, drops options proxies).
 
 Label: binary -- 1 if stock outperformed SPY next week, 0 otherwise.
 
@@ -39,9 +47,20 @@ from xgboost import XGBClassifier
 warnings.filterwarnings("ignore")
 
 MODEL_PATH    = Path(__file__).parent / "gamma_model.pkl"
+
+# Global feature set — all sectors except tech
 FEATURE_NAMES = [
     "iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level",
     "mom4w", "rsi14", "hpr52", "gex_x_vix", "macro_flag",
+    "rv_iv_ratio", "term_slope",              # #26: real IV surface proxies
+    "mom1w", "macd_hist", "mom8w", "mom13w",  # tech momentum + LOW
+]
+
+# Tech sector uses momentum features instead of options proxies (#26 retrain)
+TECH_FEATURE_NAMES = [
+    "gex_regime_flag", "vix_level", "macro_flag", "gex_x_vix",
+    "mom1w", "mom4w", "mom8w", "mom13w",
+    "rsi14", "macd_hist", "hpr52",
 ]
 
 START = "2019-01-01"
@@ -165,6 +184,15 @@ def rsi_weekly(close_w: pd.Series, window: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def macd_hist_weekly(close_w: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    """MACD histogram on weekly closes: (fast_EMA - slow_EMA) - signal_EMA."""
+    ema_fast   = close_w.ewm(span=fast,   adjust=False).mean()
+    ema_slow   = close_w.ewm(span=slow,   adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line - signal_line
+
+
 def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.DataFrame:
     """
     Compute weekly proxy features from daily OHLCV.
@@ -205,6 +233,31 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
         lambda d: is_macro_week(d.date() if hasattr(d, "date") else d)
     )
 
+    # #26 — rv_iv_ratio: HV20 / (VIX/100)
+    # Realized vol relative to market implied vol. Proxy for the RV/IV ratio
+    # that inference computes from live options. >1 = options cheap (buy signal).
+    hv20_d       = hv(close, 20)
+    hv20_w       = hv20_d.resample("W-FRI").last()
+    # vix_weekly is in VIX points (e.g. 18.5); convert to decimal for RV comparison
+    rv_iv_ratio_w = hv20_w / (vix_weekly / 100).replace(0, np.nan)
+
+    # #26 — term_slope: HV5 - HV20
+    # Proxy for IV term structure slope. Positive = inverted (near > far, stress).
+    # Inference uses actual near-expiry IV minus far-expiry IV.
+    hv5_d        = hv(close, 5)
+    hv5_w        = hv5_d.resample("W-FRI").last()
+    term_slope_w = hv5_w - hv20_w
+
+    # mom1w: 1-week return (r5d on weekly frequency) — key momentum signal for tech
+    mom1w_w  = close_w.pct_change(1)
+
+    # macd_hist: MACD histogram on weekly closes — trend momentum (tech signal)
+    macd_hist_w = macd_hist_weekly(close_w)
+
+    # mom8w / mom13w: medium-term momentum (LOW task)
+    mom8w_w  = close_w.pct_change(8)
+    mom13w_w = close_w.pct_change(13)
+
     df = pd.DataFrame({
         "iv_spread":       iv_spread_w,
         "smirk":           smirk_w,
@@ -215,6 +268,12 @@ def build_weekly_features(daily: pd.DataFrame, vix_weekly: pd.Series) -> pd.Data
         "hpr52":           hpr52_w,
         "gex_x_vix":       gex_x_vix_w,
         "macro_flag":      macro_flag_w,
+        "rv_iv_ratio":     rv_iv_ratio_w,
+        "term_slope":      term_slope_w,
+        "mom1w":           mom1w_w,
+        "macd_hist":       macd_hist_w,
+        "mom8w":           mom8w_w,
+        "mom13w":          mom13w_w,
     })
 
     # Align VIX on the same weekly index
@@ -343,13 +402,13 @@ def train() -> None:
         "feature_names": FEATURE_NAMES,
         "model_type":    "classifier",
         "dir_acc":       acc,
-        "trained_on":    "price_proxies_v4",
+        "trained_on":    "price_proxies_v5",
         "universe_size": df["symbol"].nunique(),
         "train_date":    datetime.date.today().isoformat(),
     }, MODEL_PATH)
     print(f"\n  Saved: {MODEL_PATH}")
 
-    # Sector-specific models (#29)
+    # Sector-specific models (#29, #26 tech retrain)
     print("\n--- Sector-specific models ---")
     df_sorted["sector"] = df_sorted["symbol"].apply(_get_sector)
     sector_names = list(SECTORS.keys()) + ["other"]
@@ -360,10 +419,13 @@ def train() -> None:
             print(f"  {sector:<12}: skipped (<200 rows, got {len(sector_df)})")
             continue
 
+        # Tech uses momentum-only features; all other sectors use global feature set
+        feat_names = TECH_FEATURE_NAMES if sector == "tech" else FEATURE_NAMES
+
         s_split    = int(len(sector_df) * 0.70)
-        X_s_train  = sector_df.iloc[:s_split][FEATURE_NAMES].values
+        X_s_train  = sector_df.iloc[:s_split][feat_names].values
         y_s_train  = sector_df.iloc[:s_split]["label"].values
-        X_s_test   = sector_df.iloc[s_split:][FEATURE_NAMES].values
+        X_s_test   = sector_df.iloc[s_split:][feat_names].values
         y_s_test   = sector_df.iloc[s_split:]["label"].values
 
         s_model = XGBClassifier(
@@ -374,16 +436,18 @@ def train() -> None:
         s_model.fit(X_s_train, y_s_train, eval_set=[(X_s_test, y_s_test)], verbose=False)
         s_acc  = float((s_model.predict(X_s_test) == y_s_test).mean())
         s_path = MODEL_PATH.parent / f"gamma_model_{sector}.pkl"
+        feat_label = "momentum_v1" if sector == "tech" else "price_proxies_v5"
         joblib.dump({
             "model":         s_model,
-            "feature_names": FEATURE_NAMES,
+            "feature_names": feat_names,
             "model_type":    "classifier",
             "dir_acc":       s_acc,
             "sector":        sector,
+            "trained_on":    feat_label,
             "train_date":    datetime.date.today().isoformat(),
         }, s_path)
         tag = "PASS" if s_acc > 0.52 else "INFO"
-        print(f"  {sector:<12}: acc={s_acc*100:.2f}%  [{tag}]  rows={len(sector_df)}  saved={s_path.name}")
+        print(f"  {sector:<12}: acc={s_acc*100:.2f}%  [{tag}]  feat={feat_label}  rows={len(sector_df)}  saved={s_path.name}")
 
 
 if __name__ == "__main__":
