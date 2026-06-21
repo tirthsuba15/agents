@@ -8,6 +8,8 @@ Trade-setup embedding for future use:
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
@@ -41,6 +43,11 @@ def embed_trade_setup(
 
 
 def embed(text: str) -> list[float]:
+    if not isinstance(text, str):
+        if isinstance(text, (dict, list)):
+            text = json.dumps(text)
+        else:
+            text = str(text)
     model = load_model()
     return model.encode(text).tolist()  # list[float], JSON-safe
 

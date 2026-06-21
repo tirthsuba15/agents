@@ -190,6 +190,30 @@ def get_recent_trades(n: int = 50) -> list[dict]:
     return trades
 
 
+def get_agent_weights() -> dict:
+    weights = get_latest_weights()
+    if not weights:
+        return {
+            "w_sentiment": 0.4,
+            "w_momentum": 0.35,
+            "w_gamma": 0.25,
+        }
+    return {k: weights.get(k) for k in ("w_sentiment", "w_momentum", "w_gamma")}
+
+
+def query_rag(signals_json: str, top_k: int = 5) -> list[dict]:
+    from embedder import embed
+    emb = embed(signals_json)
+    return query_similar_setups(emb, top_k)
+
+
+def update_trade_order_id(trade_id: str, order_id: str) -> None:
+    data = _wait_for(trade_id)
+    trade = json.loads(data["content"])
+    trade["alpaca_order_id"] = order_id
+    _add_memory(json.dumps(trade), trade_id, trade.get("ticker", "trade"))
+
+
 def query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
     items = _list_all_ids()
     trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
