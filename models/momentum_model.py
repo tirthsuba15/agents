@@ -72,7 +72,7 @@ def days_to_next_opex(date: datetime.date) -> int:
 _cache: dict = {}
 
 
-def _load_model():
+def _load_models():
     if "model" not in _cache:
         if not MODEL_PATH.exists():
             raise FileNotFoundError(
@@ -80,7 +80,8 @@ def _load_model():
             )
         payload = joblib.load(MODEL_PATH)
         _cache["model"] = payload["model"]
-    return _cache["model"]
+        _cache["lgbm"]  = payload.get("lgbm")
+    return _cache["model"], _cache["lgbm"]
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +96,16 @@ def predict_momentum(features_dict: dict) -> dict:
     direction  in [-1, +1]:  +1 = strong long, -1 = strong short
     conviction in [ 0,  1]:  distance from neutral (0.5 proba)
     """
-    model    = _load_model()
+    model, lgbm = _load_models()
     vec      = np.array([[features_dict[f] for f in FEATURE_NAMES]], dtype=float)
-    proba    = float(model.predict_proba(vec)[0][1])   # P(momentum held)
+    xgb_proba = float(model.predict_proba(vec)[0][1])
+
+    if lgbm is not None:
+        lgbm_proba = float(lgbm.predict_proba(vec)[0][1])
+        proba = (xgb_proba + lgbm_proba) / 2
+    else:
+        proba = xgb_proba
+
     direction  = round((proba - 0.5) * 2, 4)
     conviction = round(abs(direction), 4)
 

@@ -243,7 +243,58 @@ def build_dataset() -> pd.DataFrame:
 # Training
 # ---------------------------------------------------------------------------
 
-def train() -> None:
+def tune(n_trials: int = 50) -> None:
+    import optuna
+    from sklearn.model_selection import TimeSeriesSplit
+
+    print(f"Building dataset for tuning ({n_trials} trials)...")
+    df = build_dataset()
+    X  = df[FEATURE_NAMES].values
+    y  = df["label"].values
+
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    def objective(trial):
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 600),
+            "max_depth":        trial.suggest_int("max_depth", 3, 6),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 5, 30),
+            "eval_metric": "logloss", "random_state": 42, "n_jobs": -1,
+        }
+        accs = []
+        for train_idx, val_idx in tscv.split(X):
+            m = XGBClassifier(**params)
+            m.fit(X[train_idx], y[train_idx])
+            accs.append((m.predict(X[val_idx]) == y[val_idx]).mean())
+        return float(np.mean(accs))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    print(f"\n  Best CV accuracy : {study.best_value*100:.2f}%")
+    print(f"  Best params      : {study.best_params}")
+
+
+def _best_params() -> dict:
+    return {
+        "n_estimators": 433,
+        "max_depth": 6,
+        "learning_rate": 0.10755931942705539,
+        "subsample": 0.9573473068520665,
+        "colsample_bytree": 0.6554059690938256,
+        "eval_metric": "logloss",
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+
+
+def train(params: dict = None) -> None:
+    if params is None:
+        params = _best_params()
+
     print(f"Building cross-sectional dataset ({len(BASKET)} stocks)...")
     df = build_dataset()
     print(f"\n  Samples        : {len(df):,}")
@@ -260,22 +311,34 @@ def train() -> None:
     y_train, y_test = y[:split], y[split:]
     print(f"  Train / Test   : {len(X_train):,} / {len(X_test):,}")
 
-    model = XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="logloss",
-        random_state=42,
-        n_jobs=-1,
-    )
+    xgb_params = {k: v for k, v in params.items() if k != "min_child_weight"}
+    model = XGBClassifier(**xgb_params)
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
     acc = float((model.predict(X_test) == y_test).mean())
     tag = "PASS" if acc > 0.52 else "INFO"
-    print(f"\n  Test accuracy  : {acc*100:.2f}%  (target >52%)")
+    print(f"\n  XGB accuracy   : {acc*100:.2f}%")
     print(f"  [{tag}] {'Above' if acc > 0.52 else 'Below'} 52% threshold")
+
+    from lightgbm import LGBMClassifier
+
+    lgbm_params = {k: v for k, v in params.items()
+                   if k not in ("eval_metric", "min_child_weight", "n_estimators")}
+    lgbm = LGBMClassifier(n_estimators=params.get("n_estimators", 300),
+                           max_depth=params.get("max_depth", 4),
+                           learning_rate=params.get("learning_rate", 0.05),
+                           subsample=params.get("subsample", 0.8),
+                           colsample_bytree=params.get("colsample_bytree", 0.8),
+                           random_state=42, n_jobs=-1, verbose=-1)
+    lgbm.fit(X_train, y_train)
+
+    xgb_proba  = model.predict_proba(X_test)[:, 1]
+    lgbm_proba = lgbm.predict_proba(X_test)[:, 1]
+    ensemble_proba = (xgb_proba + lgbm_proba) / 2
+    ensemble_preds = (ensemble_proba >= 0.5).astype(int)
+    acc_ensemble = float((ensemble_preds == y_test).mean())
+    print(f"  LGBM accuracy  : {float((lgbm.predict(X_test) == y_test).mean())*100:.2f}%")
+    print(f"  Ensemble acc   : {acc_ensemble*100:.2f}%")
 
     fi = dict(zip(FEATURE_NAMES, model.feature_importances_))
     print("\n  Feature importances:")
@@ -283,9 +346,16 @@ def train() -> None:
         print(f"    {feat:<20}: {imp:.4f}")
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump({"model": model, "feature_names": FEATURE_NAMES}, MODEL_PATH)
+    joblib.dump({
+        "model": model,
+        "lgbm": lgbm,
+        "feature_names": FEATURE_NAMES,
+    }, MODEL_PATH)
     print(f"\n  Saved: {MODEL_PATH}")
 
 
 if __name__ == "__main__":
-    train()
+    if len(sys.argv) > 1 and sys.argv[1] == "tune":
+        tune()
+    else:
+        train()

@@ -1,0 +1,18 @@
+name: CI
+on:
+  push:
+    branches: ["c", "c-*"]
+  pull_request:
+    branches: ["c"]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -c "from models.momentum_model import predict_momentum, FEATURE_NAMES; print('momentum import OK')"
+      - run: python -c "from models.gex_engine import compute_gex, bs_gamma; print('gex import OK')"
+      - run: python -c "from models.gamma_model import compute_composite_scores; print('gamma import OK')"
