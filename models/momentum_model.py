@@ -25,7 +25,8 @@ import joblib
 import numpy as np
 import yfinance as yf
 
-FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex"]
+FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
+                 "overnight_return", "gex_regime_proxy"]
 MODEL_PATH    = Path(__file__).parent / "momentum_model.pkl"
 
 
@@ -157,13 +158,26 @@ def get_live_features(symbol: str = "SPY") -> dict:
     except Exception:
         pass
 
+    # overnight_return: today's open vs prior close
+    overnight = 0.0
+    if "Open" in daily.columns and len(daily) > 0:
+        today_open = float(daily["Open"].iloc[-1])
+        overnight  = (today_open / prior_close - 1) if prior_close else 0.0
+
+    # gex_regime_proxy: +1 if SPY above 50-day SMA
+    sma50      = float(daily["Close"].rolling(50, min_periods=20).mean().iloc[-1])
+    today_close = float(daily["Close"].iloc[-1])
+    gex_proxy  = 1 if today_close > sma50 else -1
+
     return {
-        "r1":           r1,
-        "opex_flag":    int(is_opex_week(today)),
-        "vix_level":    vix,
-        "volume_ratio": vol_ratio,
-        "day_of_week":  today.weekday(),
-        "days_to_opex": days_to_next_opex(today),
+        "r1":               r1,
+        "opex_flag":        int(is_opex_week(today)),
+        "vix_level":        vix,
+        "volume_ratio":     vol_ratio,
+        "day_of_week":      today.weekday(),
+        "days_to_opex":     days_to_next_opex(today),
+        "overnight_return": overnight,
+        "gex_regime_proxy": gex_proxy,
     }
 
 

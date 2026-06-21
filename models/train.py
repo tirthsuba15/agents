@@ -34,7 +34,8 @@ import yfinance as yf
 from xgboost import XGBClassifier
 
 MODEL_PATH    = Path(__file__).parent / "momentum_model.pkl"
-FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex"]
+FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
+                 "overnight_return", "gex_regime_proxy"]
 
 
 # ---------------------------------------------------------------------------
@@ -101,14 +102,17 @@ def build_dataset() -> pd.DataFrame:
 
     print("  SPY daily (2 yr)...")
     spy_d = download_daily("SPY")
-    spy_d["vol20"] = spy_d["Volume"].rolling(20, min_periods=5).mean()
+    spy_d["vol20"]    = spy_d["Volume"].rolling(20, min_periods=5).mean()
+    spy_d["sma50"]    = spy_d["Close"].rolling(50, min_periods=20).mean()
 
     print("  VIX daily (2 yr)...")
     vix_d = download_daily("^VIX")
 
     spy_closes  = spy_d["Close"].to_dict()
+    spy_opens   = spy_d["Open"].to_dict()
     spy_vols    = spy_d["Volume"].to_dict()
     spy_vol20   = spy_d["vol20"].to_dict()
+    spy_sma50   = spy_d["sma50"].to_dict()
     vix_closes  = vix_d["Close"].to_dict()
 
     daily_groups = spy_h.groupby("date")
@@ -141,15 +145,26 @@ def build_dataset() -> pd.DataFrame:
         vol20    = float(spy_vol20.get(date) or vol or 1)
         vol_ratio = vol / vol20 if vol20 > 0 else 1.0
 
+        # overnight_return: today's open vs prior close
+        today_open = spy_opens.get(date)
+        overnight  = (today_open / prior_close - 1) if today_open and prior_close else 0.0
+
+        # gex_regime_proxy: +1 if SPY above 50-day SMA (positive gamma regime), -1 otherwise
+        sma50 = spy_sma50.get(date)
+        today_close = spy_closes.get(date)
+        gex_proxy = 1 if (sma50 and today_close and today_close > sma50) else -1
+
         records.append({
-            "date":         date,
-            "r1":           r1,
-            "opex_flag":    int(is_opex_week(date)),
-            "vix_level":    vix,
-            "volume_ratio": vol_ratio,
-            "day_of_week":  date.weekday(),
-            "days_to_opex": days_to_next_opex(date),
-            "label":        label,
+            "date":             date,
+            "r1":               r1,
+            "opex_flag":        int(is_opex_week(date)),
+            "vix_level":        vix,
+            "volume_ratio":     vol_ratio,
+            "day_of_week":      date.weekday(),
+            "days_to_opex":     days_to_next_opex(date),
+            "overnight_return": overnight,
+            "gex_regime_proxy": gex_proxy,
+            "label":            label,
         })
 
     return pd.DataFrame(records).set_index("date").dropna()
