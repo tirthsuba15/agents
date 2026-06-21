@@ -211,11 +211,12 @@ def fetch_blocked_dates() -> set:
         print("  Using hardcoded FOMC/CPI/NFP dates")
         return _GATE_DATES
     blocked: set = set()
+    # Extend 90 days past today so the live scheduler has upcoming gate dates
+    live_end = datetime.date.today() + datetime.timedelta(days=90)
     cur = datetime.date.fromisoformat(START_DATE)
-    end = datetime.date.fromisoformat(END_DATE)
     any_ok = False
-    while cur <= end:
-        chunk_end = min(datetime.date(cur.year, 12, 31), end)
+    while cur <= live_end:
+        chunk_end = min(datetime.date(cur.year, 12, 31), live_end)
         try:
             r = requests.get(
                 f"{FINNHUB_BASE}/calendar/economic",
@@ -234,6 +235,7 @@ def fetch_blocked_dates() -> set:
             pass
         cur = datetime.date(cur.year + 1, 1, 1)
     if any_ok:
+        print(f"  Live Finnhub calendar: {len(blocked)} dates (through {live_end})")
         return blocked
     print("  Finnhub unavailable — using hardcoded dates")
     return _GATE_DATES
@@ -267,10 +269,10 @@ def weekly_returns_for(df: pd.DataFrame) -> pd.Series:
 # SPY regime signals
 # ---------------------------------------------------------------------------
 
-def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
+def build_spy_signals(spy_df: pd.DataFrame, trend_lookback: int = TREND_LOOKBACK) -> pd.DataFrame:
     """
     For every week, compute:
-      uptrend    — SPY prior-Friday close > 10-week rolling avg
+      uptrend    — SPY prior-Friday close > trend_lookback-week rolling avg
       prior_ret  — prior week's SPY return
     Returns DataFrame indexed by week_start.
     """
@@ -281,13 +283,12 @@ def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
         spy_closes[min(days)] = closes[max(days)]
     close_s = pd.Series(spy_closes).sort_index()
 
-    prior_close  = close_s.shift(1)
-    rolling_high = close_s.rolling(52, min_periods=26).max().shift(1)
-    near_high    = (prior_close / rolling_high) > 0.92   # within 8% of 52wk high
-    near_high    = near_high.reindex(spy_rets.index, fill_value=True)
-    prior_ret    = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
+    ma = close_s.rolling(trend_lookback, min_periods=1).mean().shift(1)
+    prior_close = close_s.shift(1)
+    uptrend = (prior_close > ma).reindex(spy_rets.index, fill_value=True)
+    prior_ret = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
 
-    return pd.DataFrame({"near_high": near_high, "prior_ret": prior_ret})
+    return pd.DataFrame({"uptrend": uptrend, "prior_ret": prior_ret})
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +345,7 @@ def label_weeks(
             opex = False
 
         # Regime filter
-        uptrend  = bool(spy_signals.loc[ws, "near_high"]) if ws in spy_signals.index else True
+        uptrend  = bool(spy_signals.loc[ws, "uptrend"]) if ws in spy_signals.index else True
         prior_ret = float(spy_signals.loc[ws, "prior_ret"]) if ws in spy_signals.index else 0.0
         smart = opex and uptrend and prior_ret > MOMENTUM_FLOOR
 
@@ -454,7 +455,7 @@ def main() -> None:
     print("OPEX Backtest v3 - 21-Stock Large-Cap Basket")
     print(f"Basket : {BASKET}")
     print(f"Period : {START_DATE} to {END_DATE}")
-    print(f"Filter : SPY within 8% of 52-week high (adaptive trend) + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
+    print(f"Filter : SPY {TREND_LOOKBACK}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
 
     print("Loading macro gate dates...")
     blocked = fetch_blocked_dates()
@@ -501,6 +502,20 @@ def main() -> None:
 
     if per_stock:
         plot_per_stock(per_stock, out_dir)
+
+    # --- 3-week vs 10-week MA trend filter comparison ---
+    print("\n--- Trend Lookback Comparison (3w vs 10w MA) ---")
+    signals_3w = build_spy_signals(spy_df, trend_lookback=3)
+    weekly_3w  = label_weeks(basket, signals_3w, blocked, spy_df)
+    print(f"  10-week MA (baseline, n={weekly[weekly['smart_opex']].shape[0]}):")
+    print_stats("Smart OPEX 10w", weekly[weekly["smart_opex"]]["ret"])
+    print(f"  3-week MA (n={weekly_3w[weekly_3w['smart_opex']].shape[0]}):")
+    print_stats("Smart OPEX 3w",  weekly_3w[weekly_3w["smart_opex"]]["ret"])
+    winner = "3w" if (
+        sharpe(weekly_3w[weekly_3w["smart_opex"]]["ret"]) >
+        sharpe(weekly[weekly["smart_opex"]]["ret"])
+    ) else "10w"
+    print(f"  => Better filter: {winner} MA")
 
     print("\nDone.")
 
