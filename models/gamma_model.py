@@ -265,12 +265,18 @@ def compute_composite_scores(feature_rows: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _try_load_xgb_model():
-    """Load trained XGBoost regressor if available."""
+    """
+    Load trained XGBoost regressor if available and trained on real options data.
+    Price-proxy models (trained_on="price_proxies") are skipped — they achieve
+    <50% directional accuracy and would degrade the formula signal.
+    """
     if MODEL_PATH.exists():
         import joblib
         payload = joblib.load(MODEL_PATH)
-        return payload.get("model")
-    return None
+        if payload.get("trained_on") == "price_proxies":
+            return None, None
+        return payload.get("model"), payload.get("normaliser", 1.0)
+    return None, None
 
 
 def train_gamma_model(historical_data: list[dict]) -> None:
@@ -353,12 +359,12 @@ def predict_gamma(target: str, universe: list[str] | None = None) -> dict:
         raise RuntimeError(f"{target} options chain unavailable")
 
     # Try XGBoost first; fall back to formula
-    xgb = _try_load_xgb_model()
+    xgb, normaliser = _try_load_xgb_model()
     if xgb:
         FEAT = ["iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level"]
         vec  = np.array([[target_row[f] for f in FEAT]])
         raw  = float(xgb.predict(vec)[0])
-        direction  = round(float(np.clip(raw, -1, 1)), 4)
+        direction  = round(float(np.clip(raw / normaliser, -1, 1)), 4)
         conviction = round(abs(direction), 4)
         method     = "xgboost_regressor"
     else:

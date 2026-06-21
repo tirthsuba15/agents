@@ -84,4 +84,26 @@ Baseline metrics recorded at end of each phase — optimizations are measured ag
 
 ---
 
-*Last updated: Phase 3 complete. Append new entries as phases are added.*
+## Phase 4 — Gamma Model (`models/gamma_model.py`, `models/train_gamma.py`)
+
+**Baseline (2026-06-21, 113 tickers, 5yr weekly, price-proxy training)**
+- Training rows: 43,279 (113 tickers × 383 weeks)
+- Proxy directional accuracy: 49.65% (target >52%) — BELOW (price proxies too noisy for 1wk excess return)
+- Proxy IC: 0.009 (target >0.03) — BELOW
+- Live inference: formula-based signal, NVDA direction=+0.82, conviction=0.82
+- XGBoost pkl trained but skipped at inference (price proxies degrade signal vs formula)
+
+**Optimizations**
+
+| # | Change | Expected impact | Effort |
+|---|--------|----------------|--------|
+| 26 | Upgrade Finnhub to get real historical options snapshots — re-train on actual IV spread/smirk/PCR instead of price proxies | Dir acc >52%, IC >0.03 | Medium (paid data) |
+| 27 | Change label from 1-week to 4-week excess return — smoother signal, less noise | +1–2% dir acc | Low |
+| 28 | Add cross-sectional momentum feature (52wk return rank) — captures style factor alongside options signal | +IC 0.01–0.02 | Low |
+| 29 | Train separate models per sector (tech vs financials vs healthcare) — sector dynamics differ significantly | Better IC per sector | Medium |
+| 30 | Add GEX regime × vix_level interaction term — positive gamma + low VIX is very different from negative gamma + high VIX | +IC 0.01 | Low |
+| 31 | Blend XGBoost output with formula score (e.g. 50/50) — reduces variance when XGBoost IC is marginal | More stable conviction | Low |
+
+---
+
+*Last updated: Phase 4 complete. Append new entries as phases are added.*
