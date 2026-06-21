@@ -9,10 +9,14 @@ import requests
 
 from config import HYDRA_DB_API_KEY, HYDRA_DB_BASE_URL, HYDRA_DB_TENANT_ID, HYDRA_DB_SUB_TENANT_ID
 
-HEADERS = {
-    "Authorization": f"Bearer {HYDRA_DB_API_KEY}",
-    "Content-Type": "application/json",
-}
+
+def _headers() -> dict:
+    if not HYDRA_DB_API_KEY:
+        raise RuntimeError("HYDRA_DB_API_KEY not set")
+    return {
+        "Authorization": f"Bearer {HYDRA_DB_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
 
 def _now_iso() -> str:
@@ -25,7 +29,7 @@ def _source_id(prefix: str) -> str:
 
 def _request(method: str, path: str, json_body: dict = None, timeout: int = 30) -> dict:
     url = f"{HYDRA_DB_BASE_URL}{path}"
-    resp = requests.request(method, url, headers=HEADERS, json=json_body, timeout=timeout)
+    resp = requests.request(method, url, headers=_headers(), json=json_body, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -163,11 +167,18 @@ def log_weights(w_sentiment: float, w_momentum: float, w_gamma: float,
     _add_memory(json.dumps(record), sid, "agent weights")
 
 
-def log_strategy_candidate(candidate_dict: dict) -> str:
+def log_strategy_candidate(candidate_dict: dict, embedding: list[float] | None = None) -> str:
     sid = _source_id("candidate")
     uid = sid.split(":")[-1]
     candidate_dict["id"] = uid
     candidate_dict.setdefault("timestamp", _now_iso())
+    if embedding is not None:
+        candidate_dict["embedding"] = embedding
+    else:
+        text = candidate_dict.get("description") or candidate_dict.get("setup_description") or ""
+        if text:
+            from embedder import embed
+            candidate_dict["embedding"] = embed(text)
     desc = candidate_dict.get("description", "strategy")[:40]
     _add_memory(json.dumps(candidate_dict), sid, f"candidate {desc}")
     return sid
@@ -210,7 +221,7 @@ def _delete_memory(memory_id: str) -> None:
         "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
         "memory_id": memory_id,
     }
-    resp = _req.delete(url, headers=HEADERS, params=params, timeout=15)
+    resp = _req.delete(url, headers=_headers(), params=params, timeout=15)
     resp.raise_for_status()
 
 
@@ -261,6 +272,76 @@ def _fetch_trade_with_retry(tid: str, retries: int = 2, req_timeout: int = 15) -
     return None
 
 
+def _cosine_similarity(vec: np.ndarray, query: np.ndarray) -> float | None:
+    if vec.ndim != 1 or query.ndim != 1 or vec.shape[0] != query.shape[0]:
+        return None
+    norm_q = np.linalg.norm(query)
+    norm_v = np.linalg.norm(vec)
+    if norm_q == 0.0 or norm_v == 0.0:
+        return None
+    return float(np.dot(query, vec) / (norm_q * norm_v))
+
+
+def query_similar_candidates(query, top_k=5, status=None) -> list[dict]:
+    if isinstance(query, str):
+        from embedder import embed
+        query_emb = np.asarray(embed(query), dtype=np.float64)
+    else:
+        query_emb = np.asarray(query, dtype=np.float64)
+
+    items = _list_all_ids()
+    candidate_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("candidate:")]
+    candidate_ids.sort(reverse=True)
+    candidate_ids = candidate_ids[:RAG_MAX_SCAN]
+
+    scored = []
+
+    def _score_candidate(tid: str):
+        rec = _fetch_trade_with_retry(tid)
+        if rec is None:
+            return None
+        stored_emb = rec.get("embedding")
+        if not isinstance(stored_emb, list):
+            return None
+        if status is not None and rec.get("status") != status:
+            return None
+        vec = np.asarray(stored_emb, dtype=np.float64)
+        sim = _cosine_similarity(vec, query_emb)
+        if sim is None:
+            return None
+        return (sim, rec, tid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        for result in pool.map(_score_candidate, candidate_ids):
+            if result is not None:
+                scored.append(result)
+
+    if not scored and len(candidate_ids) < 100:
+        time.sleep(3)
+        items = _list_all_ids()
+        candidate_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("candidate:")]
+        candidate_ids.sort(reverse=True)
+        candidate_ids = candidate_ids[:RAG_MAX_SCAN]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            for result in pool.map(_score_candidate, candidate_ids):
+                if result is not None:
+                    scored.append(result)
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    scored = scored[:top_k]
+
+    return [{
+        "id": rec.get("id"),
+        "source": rec.get("source"),
+        "description": rec.get("description"),
+        "params_json": rec.get("params_json"),
+        "backtest_sharpe": rec.get("backtest_sharpe"),
+        "backtest_cagr": rec.get("backtest_cagr"),
+        "status": rec.get("status"),
+        "similarity": sim,
+    } for sim, rec, _ in scored]
+
+
 def query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
     items = _list_all_ids()
     trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
@@ -279,19 +360,26 @@ def query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
         if outcome is None or not isinstance(stored_emb, list):
             return None
         vec = np.asarray(stored_emb, dtype=np.float64)
-        if vec.ndim != 1 or query.ndim != 1 or vec.shape[0] != query.shape[0]:
+        sim = _cosine_similarity(vec, query)
+        if sim is None:
             return None
-        norm_q = np.linalg.norm(query)
-        norm_v = np.linalg.norm(vec)
-        if norm_q == 0.0 or norm_v == 0.0:
-            return None
-        sim = float(np.dot(query, vec) / (norm_q * norm_v))
         return (sim, rec, tid)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
         for result in pool.map(_score, trade_ids):
             if result is not None:
                 scored.append(result)
+
+    if not scored and len(trade_ids) < 100:
+        time.sleep(3)
+        items = _list_all_ids()
+        trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+        trade_ids.sort(reverse=True)
+        trade_ids = trade_ids[:RAG_MAX_SCAN]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            for result in pool.map(_score, trade_ids):
+                if result is not None:
+                    scored.append(result)
 
     scored.sort(key=lambda x: x[0], reverse=True)
     scored = scored[:top_k]
