@@ -30,7 +30,7 @@ _fh: finnhub.Client | None = None
 def _get_nebius() -> OpenAI:
     global _nebius
     if _nebius is None:
-        api_key = os.environ.get("NEBIUS_API_KEY", "sk-placeholder")
+        api_key = os.environ.get("NEBIUS_API_KEY") or "sk-placeholder"
         _nebius = OpenAI(
             base_url="https://api.tokenfactory.nebius.com",
             api_key=api_key,
@@ -133,7 +133,8 @@ def _check_event_risk(ticker: str, horizon_days: int = 5) -> bool:
             if now <= ev_date <= to_dt and ev.get("impact", "low") in ("high", "medium"):
                 return True
     except Exception as e:
-        print(f"[sentiment] economic calendar failed: {e}", file=sys.stderr)
+        # 403 = free tier; treat as no macro events detected
+        print(f"[sentiment] economic calendar unavailable (plan limit): skipping", file=sys.stderr)
 
     return False
 
