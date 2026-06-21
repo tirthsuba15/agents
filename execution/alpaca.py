@@ -29,7 +29,7 @@ from alpaca.common.exceptions import APIError
 
 import hydradb
 
-_PAPER_URL = "https://paper-api.alpaca.markets"
+_PAPER_URL = os.environ.get("APCA_BASE_URL", "https://paper-api.alpaca.markets")
 
 _client: TradingClient | None = None
 
