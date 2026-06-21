@@ -19,13 +19,9 @@ APCA_API_KEY_ID: str = os.environ.get("APCA_API_KEY_ID", "")
 APCA_API_SECRET_KEY: str = os.environ.get("APCA_API_SECRET_KEY", "")
 APCA_BASE_URL: str = os.environ.get("APCA_BASE_URL", "https://paper-api.alpaca.markets")
 
-# --- Nebius (Token Factory + Serverless Studio) ---
+# --- Nebius Token Factory (ALL models — Serverless deprecated) ---
 NEBIUS_API_KEY: str = os.environ.get("NEBIUS_API_KEY", "")
 NEBIUS_BASE_URL: str = os.environ.get("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com")
-NEBIUS_SERVERLESS_API_KEY: str = os.environ.get("NEBIUS_SERVERLESS_API_KEY", "")
-NEBIUS_SERVERLESS_ENDPOINT: str = os.environ.get(
-    "NEBIUS_SERVERLESS_ENDPOINT", "https://api.studio.nebius.ai/v1"
-)
 MODEL_SENTIMENT: str = "meta-llama/Llama-3.3-70B-Instruct"
 MODEL_META: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 MODEL_RESEARCHER: str = "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1"

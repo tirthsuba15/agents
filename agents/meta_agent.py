@@ -25,12 +25,13 @@ import embedder
 from agents.sentiment import SignalObject, _check_event_risk, _fetch_vix
 from execution.alpaca import submit_order
 
-# ── Nebius Serverless AI client (Qwen3 235B) ────────────────────
+# ── Nebius Token Factory client (Qwen3 235B) ────────────────────
+# All Nebius models run on Token Factory now (Serverless deprecated).
 _NEBIUS_ENDPOINT = os.environ.get(
-    "NEBIUS_SERVERLESS_ENDPOINT",
-    "https://api.studio.nebius.ai/v1",   # default Nebius Serverless endpoint
+    "NEBIUS_BASE_URL",
+    "https://api.tokenfactory.nebius.com",   # Token Factory endpoint (all models)
 )
-_MODEL = "Qwen/Qwen3-235B-A22B"
+_MODEL = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 _MODEL_VERSION = "qwen3-235b-a22b-v1"
 
 _qwen: OpenAI | None = None
@@ -39,12 +40,8 @@ _qwen: OpenAI | None = None
 def _get_qwen() -> OpenAI:
     global _qwen
     if _qwen is None:
-        # Prefer dedicated serverless key; fall back to Token Factory key
-        api_key = (
-            os.environ.get("NEBIUS_SERVERLESS_API_KEY")
-            or os.environ.get("NEBIUS_API_KEY")
-            or "sk-placeholder"
-        )
+        # Token Factory key for all Nebius models
+        api_key = os.environ.get("NEBIUS_API_KEY") or "sk-placeholder"
         _qwen = OpenAI(base_url=_NEBIUS_ENDPOINT, api_key=api_key)
     return _qwen
 
