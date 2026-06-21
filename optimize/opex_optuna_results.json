@@ -1,0 +1,73 @@
+{
+  "target": "OPEX smart-filter strategy (Option B)",
+  "objective": "deployable-capital annualised Sharpe (net of proportional cost); params selected on train+val (2015-2021), reported on held-out test (2022-2024); KELLY_FRACTION fixed at 0.25 for both",
+  "data": {
+    "source": "yfinance daily",
+    "basket": [
+      "AAPL",
+      "MSFT",
+      "GOOGL",
+      "AMZN",
+      "META",
+      "NVDA",
+      "JPM",
+      "JNJ",
+      "UNH",
+      "HD",
+      "WMT",
+      "PG",
+      "BAC",
+      "MA",
+      "V",
+      "ABBV",
+      "MRK",
+      "PFE",
+      "XLK",
+      "XLV",
+      "XLF"
+    ],
+    "period": [
+      "2015-01-01",
+      "2024-12-31"
+    ],
+    "train_window": [
+      "2015-01-01",
+      "2020-12-31"
+    ],
+    "validation_window": [
+      "2021-01-01",
+      "2021-12-31"
+    ],
+    "test_window_heldout": [
+      "2022-01-01",
+      "2024-12-31"
+    ]
+  },
+  "cost_model": {
+    "cost_per_entry_return": 0.0015,
+    "bps_round_trip": 15.0
+  },
+  "min_trades_constraint": 20,
+  "baseline_params": {
+    "TREND_LOOKBACK": 10,
+    "MOMENTUM_FLOOR": -0.01,
+    "VIX_THRESHOLD": 30.0,
+    "KELLY_FRACTION": 0.25
+  },
+  "best_params": {
+    "TREND_LOOKBACK": 24,
+    "MOMENTUM_FLOOR": -0.04458955682315433,
+    "VIX_THRESHOLD": 16.939620689491836,
+    "KELLY_FRACTION": 0.25
+  },
+  "baseline_validation_sharpe": -1.4112,
+  "optimized_validation_sharpe": 1.4078,
+  "baseline_test_sharpe_OOS": -0.1857,
+  "optimized_test_sharpe_OOS": 1.1511,
+  "delta_test_sharpe_OOS": 1.3368,
+  "baseline_test_trades": 22,
+  "optimized_test_trades": 16,
+  "n_trials": 400,
+  "elapsed_seconds": 10.6,
+  "timestamp": "2026-06-21T16:10:55"
+}

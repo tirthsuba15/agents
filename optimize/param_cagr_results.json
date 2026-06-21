@@ -1,0 +1,127 @@
+{
+  "objective": "in-market annualized CAGR (kelly-sized)",
+  "basket": [
+    "NVDA",
+    "JNJ",
+    "UNH",
+    "WMT",
+    "HD",
+    "ABBV",
+    "AAPL",
+    "V"
+  ],
+  "n_trials": 600,
+  "min_trades_train": 15,
+  "train_window": [
+    "2015-01-01",
+    "2020-12-31"
+  ],
+  "oos_window": [
+    "2021-01-01",
+    "2024-12-31"
+  ],
+  "best_params": {
+    "trend_lookback": 7,
+    "momentum_floor": -0.029095251035633724,
+    "vix_threshold": 38.48036216988385,
+    "kelly_fraction": 1.499986178991528
+  },
+  "train_cagr_pct": 97.79,
+  "train_n_trades": 20,
+  "train_mean_weekly_ret_pct": 1.2537,
+  "oos_cagr_pct": 47.8,
+  "oos_n_trades": 13,
+  "oos_mean_weekly_ret_pct": 0.6129,
+  "top10_trials": [
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.029095251035633724,
+        "vix_threshold": 38.48036216988385,
+        "kelly_fraction": 1.499986178991528
+      },
+      "train_cagr_pct": 97.79
+    },
+    {
+      "params": {
+        "trend_lookback": 8,
+        "momentum_floor": -0.030523827119126955,
+        "vix_threshold": 39.479718438278034,
+        "kelly_fraction": 1.4999765175643287
+      },
+      "train_cagr_pct": 97.79
+    },
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.02738984332516073,
+        "vix_threshold": 39.04902046244978,
+        "kelly_fraction": 1.4999070664145926
+      },
+      "train_cagr_pct": 97.78
+    },
+    {
+      "params": {
+        "trend_lookback": 8,
+        "momentum_floor": -0.030954263465506542,
+        "vix_threshold": 38.49351747866163,
+        "kelly_fraction": 1.4998992640311948
+      },
+      "train_cagr_pct": 97.78
+    },
+    {
+      "params": {
+        "trend_lookback": 8,
+        "momentum_floor": -0.031491106844453706,
+        "vix_threshold": 39.04743083979987,
+        "kelly_fraction": 1.4998991246726279
+      },
+      "train_cagr_pct": 97.78
+    },
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.027272952679526598,
+        "vix_threshold": 41.13039756117473,
+        "kelly_fraction": 1.4997549915554336
+      },
+      "train_cagr_pct": 97.77
+    },
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.02821134579023813,
+        "vix_threshold": 39.70200292013276,
+        "kelly_fraction": 1.4996577353784908
+      },
+      "train_cagr_pct": 97.77
+    },
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.027313861980518443,
+        "vix_threshold": 39.05176753032175,
+        "kelly_fraction": 1.4996196068537984
+      },
+      "train_cagr_pct": 97.77
+    },
+    {
+      "params": {
+        "trend_lookback": 8,
+        "momentum_floor": -0.02816162613344054,
+        "vix_threshold": 39.4176462493699,
+        "kelly_fraction": 1.4996073318556535
+      },
+      "train_cagr_pct": 97.76
+    },
+    {
+      "params": {
+        "trend_lookback": 7,
+        "momentum_floor": -0.028404155053701943,
+        "vix_threshold": 39.16767791066247,
+        "kelly_fraction": 1.4996026218417218
+      },
+      "train_cagr_pct": 97.76
+    }
+  ]
+}

@@ -1,0 +1,144 @@
+{
+  "meta": {
+    "train_window": [
+      "2015-01-01",
+      "2020-12-31"
+    ],
+    "oos_window": [
+      "2021-01-01",
+      "2024-12-31"
+    ],
+    "n_trials": 500,
+    "k_range": [
+      3,
+      15
+    ],
+    "min_trades": 15,
+    "trend_lookback": 10,
+    "momentum_floor": -0.01,
+    "vix_threshold": 30
+  },
+  "baseline_oos": {
+    "tickers": [
+      "AAPL",
+      "ABBV",
+      "AMZN",
+      "BAC",
+      "GOOGL",
+      "HD",
+      "JNJ",
+      "JPM",
+      "MA",
+      "META",
+      "MRK",
+      "MSFT",
+      "NVDA",
+      "PFE",
+      "PG",
+      "UNH",
+      "V",
+      "WMT",
+      "XLF",
+      "XLK",
+      "XLV"
+    ],
+    "oos_cagr_pct": 9.22,
+    "oos_n_trades": 14
+  },
+  "top5_baskets": [
+    {
+      "rank": 1,
+      "tickers": [
+        "MA",
+        "NVDA",
+        "UNH"
+      ],
+      "k": 3,
+      "train_mean_ret_pct": 1.0403,
+      "train_cagr_pct": 54.1,
+      "train_n_trades": 17,
+      "oos_mean_ret_pct": 0.2265,
+      "oos_cagr_pct": 11.78,
+      "oos_n_trades": 14
+    },
+    {
+      "rank": 2,
+      "tickers": [
+        "MRK",
+        "NVDA",
+        "UNH"
+      ],
+      "k": 3,
+      "train_mean_ret_pct": 0.8953,
+      "train_cagr_pct": 46.56,
+      "train_n_trades": 17,
+      "oos_mean_ret_pct": 0.3623,
+      "oos_cagr_pct": 18.84,
+      "oos_n_trades": 14
+    },
+    {
+      "rank": 3,
+      "tickers": [
+        "MA",
+        "NVDA",
+        "PG",
+        "UNH"
+      ],
+      "k": 4,
+      "train_mean_ret_pct": 0.8899,
+      "train_cagr_pct": 46.27,
+      "train_n_trades": 17,
+      "oos_mean_ret_pct": 0.2272,
+      "oos_cagr_pct": 11.81,
+      "oos_n_trades": 14
+    },
+    {
+      "rank": 4,
+      "tickers": [
+        "MA",
+        "NVDA",
+        "UNH",
+        "XLV"
+      ],
+      "k": 4,
+      "train_mean_ret_pct": 0.8876,
+      "train_cagr_pct": 46.16,
+      "train_n_trades": 17,
+      "oos_mean_ret_pct": 0.1364,
+      "oos_cagr_pct": 7.09,
+      "oos_n_trades": 14
+    },
+    {
+      "rank": 5,
+      "tickers": [
+        "JNJ",
+        "JPM",
+        "MA",
+        "NVDA",
+        "UNH"
+      ],
+      "k": 5,
+      "train_mean_ret_pct": 0.8752,
+      "train_cagr_pct": 45.51,
+      "train_n_trades": 17,
+      "oos_mean_ret_pct": 0.3116,
+      "oos_cagr_pct": 16.21,
+      "oos_n_trades": 14
+    }
+  ],
+  "winner": {
+    "rank": 1,
+    "tickers": [
+      "MA",
+      "NVDA",
+      "UNH"
+    ],
+    "k": 3,
+    "train_mean_ret_pct": 1.0403,
+    "train_cagr_pct": 54.1,
+    "train_n_trades": 17,
+    "oos_mean_ret_pct": 0.2265,
+    "oos_cagr_pct": 11.78,
+    "oos_n_trades": 14
+  }
+}
