@@ -13,6 +13,7 @@ APCA_API_SECRET_KEY: str = os.environ.get("APCA_API_SECRET_KEY", "")
 APCA_BASE_URL: str = os.environ.get("APCA_BASE_URL", "https://paper-api.alpaca.markets")
 
 NEBIUS_API_KEY: str = os.environ.get("NEBIUS_API_KEY", "")
+NEBIUS_SERVERLESS_API_KEY: str = os.environ.get("NEBIUS_SERVERLESS_API_KEY", "")
 NEBIUS_SERVERLESS_ENDPOINT: str = os.environ.get(
     "NEBIUS_SERVERLESS_ENDPOINT", "https://api.studio.nebius.ai/v1"
 )

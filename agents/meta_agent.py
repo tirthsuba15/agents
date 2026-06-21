@@ -39,7 +39,12 @@ _qwen: OpenAI | None = None
 def _get_qwen() -> OpenAI:
     global _qwen
     if _qwen is None:
-        api_key = os.environ.get("NEBIUS_API_KEY") or "sk-placeholder"
+        # Prefer dedicated serverless key; fall back to Token Factory key
+        api_key = (
+            os.environ.get("NEBIUS_SERVERLESS_API_KEY")
+            or os.environ.get("NEBIUS_API_KEY")
+            or "sk-placeholder"
+        )
         _qwen = OpenAI(base_url=_NEBIUS_ENDPOINT, api_key=api_key)
     return _qwen
 
