@@ -41,7 +41,7 @@ from data.fred_client import get_risk_free_rate
 # ---------------------------------------------------------------------------
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 FINNHUB_BASE    = "https://finnhub.io/api/v1"
-MAX_DTE         = 90   # ignore options expiring beyond 90 days (minimal gamma)
+MAX_DTE         = 45   # front-month + next-month only (most gamma-dense)
 MIN_IV          = 0.01 # ignore near-zero IV (data artifacts)
 
 # ---------------------------------------------------------------------------
@@ -234,6 +234,45 @@ def compute_vanna_charm(
 
 
 # ---------------------------------------------------------------------------
+# Delta exposure (#12)
+# ---------------------------------------------------------------------------
+
+def compute_delta_exposure(
+    options_chain: OptionsChain,
+    spot_price: float,
+    r: float,
+    q: float,
+) -> float:
+    """
+    Total dealer delta exposure in dollars.
+    Call delta positive (dealers long delta), put delta negative.
+    Net positive = dealers net long delta vs market.
+    """
+    total = 0.0
+    for opt in options_chain:
+        T = _tte(opt["expiry"])
+        if T <= 0:
+            continue
+        K = opt["strike"]
+
+        call_iv = opt.get("call_iv", 0.0)
+        call_oi = opt.get("call_oi", 0)
+        if call_iv >= MIN_IV and call_oi > 0:
+            d1, _ = _d1_d2(spot_price, K, T, r, q, call_iv)
+            call_delta = math.exp(-q * T) * norm.cdf(d1)
+            total += call_delta * call_oi * 100 * spot_price
+
+        put_iv = opt.get("put_iv", 0.0)
+        put_oi = opt.get("put_oi", 0)
+        if put_iv >= MIN_IV and put_oi > 0:
+            d1, _ = _d1_d2(spot_price, K, T, r, q, put_iv)
+            put_delta = math.exp(-q * T) * (norm.cdf(d1) - 1)
+            total += put_delta * put_oi * 100 * spot_price
+
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Data fetching — Finnhub first, yfinance fallback
 # ---------------------------------------------------------------------------
 
@@ -361,7 +400,7 @@ def main(symbol: str) -> None:
     print(f"  Spot           : ${spot:.2f}")
     print(f"  Dividend yield : {q*100:.3f}%")
 
-    print(f"Fetching options chain ({symbol}, <=90 DTE)...")
+    print(f"Fetching options chain ({symbol}, <={MAX_DTE} DTE)...")
     chain = fetch_options_chain(symbol)
     if not chain:
         print("  ERROR: empty options chain — cannot compute GEX")
@@ -372,15 +411,17 @@ def main(symbol: str) -> None:
     flip     = find_zero_gamma_flip(chain, spot, r, q)
     regime   = get_gex_regime(net_gex, spot, flip)
     vc       = compute_vanna_charm(chain, spot, r, q)
+    net_dex  = compute_delta_exposure(chain, spot, r, q)
 
-    print(f"\n{'─'*45}")
+    print(f"\n{'-'*45}")
     print(f"  Net GEX          : ${net_gex:>15,.0f}")
+    print(f"  Net DEX          : ${net_dex:>15,.0f}")
     print(f"  Zero-gamma flip  : ${flip:>10.2f}")
     print(f"  Spot vs flip     :  {'ABOVE' if spot > flip else 'BELOW'} flip by ${abs(spot-flip):.2f}")
     print(f"  Regime           :  {regime}")
     print(f"  Net Vanna        : {vc['net_vanna']:>15,.2f}")
     print(f"  Net Charm        : {vc['net_charm']:>15,.2f}")
-    print(f"{'─'*45}")
+    print(f"{'-'*45}")
 
     regime_msg = {
         "positive_gamma": "Market pinned — dealers BUY dips, SELL rips. Favour mean-reversion.",

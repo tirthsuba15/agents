@@ -1,0 +1,18 @@
+# Person A — agents / graph / execution
+langgraph
+openai
+alpaca-py
+finnhub-python
+python-dotenv
+# Person B — memory / RAG / embeddings
+requests
+numpy>=1.24.0
+sentence-transformers
+# Person C — models / backtest
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+pandas>=2.0.0
+scipy>=1.11.0
+yfinance>=0.2.40
+matplotlib>=3.7.0

@@ -3,6 +3,7 @@ Person B's real HydraDB client.
 Falls back to stub behaviour if HYDRA_DB_API_KEY is not set.
 """
 from __future__ import annotations
+import concurrent.futures
 import json
 import os
 import time
@@ -55,6 +56,7 @@ if _LIVE:
         "Authorization": f"Bearer {HYDRA_DB_API_KEY}",
         "Content-Type": "application/json",
     }
+    RAG_MAX_SCAN = 200
 
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -167,6 +169,55 @@ if _LIVE:
         trade["alpaca_order_id"] = order_id
         _add_memory(json.dumps(trade), trade_id, trade.get("ticker", "trade"))
 
+    def _delete_memory(memory_id: str) -> None:
+        url = f"{HYDRA_DB_BASE_URL}/memories/delete_memory"
+        params = {
+            "tenant_id": HYDRA_DB_TENANT_ID,
+            "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+            "memory_id": memory_id,
+        }
+        resp = _requests.delete(url, headers=_HEADERS, params=params, timeout=15)
+        resp.raise_for_status()
+
+    def clear_all_memories() -> int:
+        items = _list_all_ids()
+        count = 0
+        for item in items:
+            mid = item.get("memory_id")
+            if mid:
+                try:
+                    _delete_memory(mid)
+                    count += 1
+                except Exception:
+                    pass
+        return count
+
+    def _fetch_trade_with_retry(tid: str, retries: int = 2, req_timeout: int = 15) -> dict | None:
+        for attempt in range(retries + 1):
+            try:
+                data = _request("POST", "/fetch/content", {
+                    "tenant_id": HYDRA_DB_TENANT_ID,
+                    "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                    "source_id": tid,
+                    "mode": "content",
+                })
+                if not data.get("content"):
+                    return None
+                return json.loads(data["content"])
+            except Exception:
+                if attempt < retries:
+                    time.sleep(1)
+        return None
+
+    def _cosine_similarity(vec: np.ndarray, query: np.ndarray) -> float | None:
+        if vec.ndim != 1 or query.ndim != 1 or vec.shape != query.shape:
+            return None
+        norm_q = np.linalg.norm(query)
+        norm_v = np.linalg.norm(vec)
+        if norm_q == 0.0 or norm_v == 0.0:
+            return None
+        return float(np.dot(query, vec) / (norm_q * norm_v))
+
     def query_rag(query_text: str, top_k: int = 5) -> list[dict]:
         from embedder import embed
         emb = embed(query_text)
@@ -175,34 +226,30 @@ if _LIVE:
     def _query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
         items = _list_all_ids()
         trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+        trade_ids.sort(reverse=True)
+        trade_ids = trade_ids[:RAG_MAX_SCAN]
         query = np.asarray(embedding_vector, dtype=np.float64)
         scored = []
-        for tid in trade_ids:
-            data = _request("POST", "/fetch/content", {
-                "tenant_id": HYDRA_DB_TENANT_ID,
-                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
-                "source_id": tid,
-                "mode": "content",
-            })
-            if not data.get("content"):
-                continue
-            try:
-                rec = json.loads(data["content"])
-            except (json.JSONDecodeError, TypeError):
-                continue
+
+        def _score(tid: str):
+            rec = _fetch_trade_with_retry(tid)
+            if rec is None:
+                return None
             outcome = rec.get("outcome")
             stored_emb = rec.get("embedding")
             if outcome is None or not isinstance(stored_emb, list):
-                continue
+                return None
             vec = np.asarray(stored_emb, dtype=np.float64)
-            if vec.ndim != 1 or query.ndim != 1 or vec.shape[0] != query.shape[0]:
-                continue
-            norm_q = np.linalg.norm(query)
-            norm_v = np.linalg.norm(vec)
-            if norm_q == 0.0 or norm_v == 0.0:
-                continue
-            similarity = float(np.dot(query, vec) / (norm_q * norm_v))
-            scored.append((similarity, rec, tid))
+            sim = _cosine_similarity(vec, query)
+            if sim is None:
+                return None
+            return (sim, rec, tid)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            for result in pool.map(_score, trade_ids):
+                if result is not None:
+                    scored.append(result)
+
         scored.sort(key=lambda x: x[0], reverse=True)
         results = []
         for sim, rec, tid in scored[:top_k]:
@@ -276,3 +323,7 @@ else:
 
     def update_trade_outcome(trade_id: str, pnl_bps: float, outcome: bool) -> None:
         pass
+
+    def clear_all_memories() -> int:
+        print("[HydraDB STUB] clear_all_memories → 0")
+        return 0

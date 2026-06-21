@@ -171,6 +171,29 @@ def get_vix() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Price-factor features (momentum, RSI, 52wk high proximity)
+# ---------------------------------------------------------------------------
+
+def _get_price_factors(symbol: str) -> dict:
+    """Compute mom4w, rsi14, hpr52 from the last ~400 days of daily closes."""
+    defaults = {"mom4w": 0.0, "rsi14": 50.0, "hpr52": 1.0}
+    try:
+        bars  = yf.Ticker(symbol).history(period="400d", auto_adjust=True)
+        if bars.empty or len(bars) < 30:
+            return defaults
+        close = bars["Close"]
+        mom4w = float(close.iloc[-1] / close.iloc[-20] - 1) if len(close) >= 20 else 0.0
+        delta = close.diff()
+        gain  = float(delta.clip(lower=0).rolling(14).mean().iloc[-1])
+        loss  = float((-delta.clip(upper=0)).rolling(14).mean().iloc[-1])
+        rsi14 = 100 - (100 / (1 + gain / loss)) if loss > 0 else 100.0
+        hpr52 = float(close.iloc[-1] / close.rolling(252).max().iloc[-1]) if len(close) >= 252 else 1.0
+        return {"mom4w": mom4w, "rsi14": rsi14, "hpr52": hpr52}
+    except Exception:
+        return defaults
+
+
+# ---------------------------------------------------------------------------
 # Full feature dict for one ticker
 # ---------------------------------------------------------------------------
 
@@ -194,6 +217,7 @@ def compute_gamma_features(
         smirk           = compute_smirk(chain, spot, r, q)
         pcr             = compute_pcr(chain)
         gex_regime_flag = compute_gex_regime_flag(chain, spot, r, q)
+        price_factors   = _get_price_factors(symbol)
 
         return {
             "symbol":          symbol,
@@ -203,6 +227,7 @@ def compute_gamma_features(
             "pcr":             pcr,
             "gex_regime_flag": gex_regime_flag,
             "vix_level":       vix,
+            **price_factors,
         }
     except Exception as exc:
         print(f"    {symbol}: skipped ({exc})")
@@ -265,12 +290,22 @@ def compute_composite_scores(feature_rows: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _try_load_xgb_model():
-    """Load trained XGBoost regressor if available."""
+    """
+    Load trained XGBoost model if it beats random (dir_acc > 0.50).
+    Returns (model, model_type, feature_names, normaliser) or all-None tuple.
+    """
     if MODEL_PATH.exists():
         import joblib
         payload = joblib.load(MODEL_PATH)
-        return payload.get("model")
-    return None
+        if payload.get("dir_acc", 0) < 0.51:
+            return None, None, None, None
+        return (
+            payload.get("model"),
+            payload.get("model_type", "regressor"),
+            payload.get("feature_names", FEATURE_NAMES),
+            payload.get("normaliser", 1.0),
+        )
+    return None, None, None, None
 
 
 def train_gamma_model(historical_data: list[dict]) -> None:
@@ -353,14 +388,17 @@ def predict_gamma(target: str, universe: list[str] | None = None) -> dict:
         raise RuntimeError(f"{target} options chain unavailable")
 
     # Try XGBoost first; fall back to formula
-    xgb = _try_load_xgb_model()
+    xgb, model_type, feat_names, normaliser = _try_load_xgb_model()
     if xgb:
-        FEAT = ["iv_spread", "smirk", "pcr", "gex_regime_flag", "vix_level"]
-        vec  = np.array([[target_row[f] for f in FEAT]])
-        raw  = float(xgb.predict(vec)[0])
-        direction  = round(float(np.clip(raw, -1, 1)), 4)
+        vec = np.array([[target_row.get(f, 0.0) for f in feat_names]])
+        if model_type == "classifier":
+            proba      = float(xgb.predict_proba(vec)[0][1])
+            direction  = round((proba - 0.5) * 2, 4)
+        else:
+            raw        = float(xgb.predict(vec)[0])
+            direction  = round(float(np.clip(raw / normaliser, -1, 1)), 4)
         conviction = round(abs(direction), 4)
-        method     = "xgboost_regressor"
+        method     = f"xgboost_{model_type}"
     else:
         scored = compute_composite_scores(feature_rows)
         result = next(s for s in scored if s["symbol"] == target)
