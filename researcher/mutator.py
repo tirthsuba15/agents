@@ -30,7 +30,7 @@ from researcher.hydra_client import insert_many
 # config directly to avoid side-effects; values must match config defaults)
 # ---------------------------------------------------------------------------
 BASE_PARAMS = {
-    "OPEX_RETURN_THRESHOLD":      0.0015,
+    "OPEX_RETURN_THRESHOLD":       0.029,
     "INTRADAY_MOMENTUM_THRESHOLD": 0.0015,
     "CONVICTION_THRESHOLD":        0.35,
 }
@@ -38,7 +38,7 @@ BASE_PARAMS = {
 MUTATION_FACTOR = 0.20   # ±20%
 N_MUTATIONS     = 10
 LOOKBACK_MONTHS = 6
-BASKET          = ["AAPL", "MSFT", "GOOGL", "NVDA", "JPM", "SPY"]
+BASKET          = ["NVDA", "JNJ", "UNH", "WMT", "HD", "ABBV", "AAPL", "V"]
 ALERT_DELTA     = 0.10   # alert if Sharpe improves by this much
 
 

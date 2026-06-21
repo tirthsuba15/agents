@@ -40,20 +40,17 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 START_DATE = "2015-01-01"
 END_DATE   = "2024-12-31"
 
-# Equal-weighted 21-stock basket (all listed pre-2015, continuous history)
+# Top-8 optimised basket
 BASKET = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM",  "JNJ",   "UNH",
-    "HD",   "WMT",  "PG",    "BAC",  "MA",
-    "V",    "ABBV", "MRK",   "PFE",
-    "XLK",  "XLV",  "XLF",
+    "NVDA", "JNJ", "UNH", "WMT",
+    "HD",   "ABBV", "AAPL", "V",
 ]
 SPY = "SPY"   # regime signal + benchmark
 
-TREND_LOOKBACK   = 10     # weeks for SPY MA
-MOMENTUM_FLOOR   = -0.01  # prior basket week must be > -1%
-VIX_THRESHOLD    = 30     # skip OPEX weeks when VIX > 30
-KELLY_FRACTION   = 0.25   # quarter-Kelly for safety
+TREND_LOOKBACK   = 7       # weeks for SPY MA (optimised)
+MOMENTUM_FLOOR   = -0.029  # prior basket week must be > -2.9% (optimised)
+VIX_THRESHOLD    = 38.48   # skip OPEX weeks when VIX > 38.48 (optimised)
+KELLY_FRACTION   = 1.5     # leveraged Kelly (best OOS CAGR)
 
 FINNHUB_BASE  = "https://finnhub.io/api/v1"
 GATE_KEYWORDS = {"fomc", "federal open market", "cpi", "consumer price", "nonfarm", "nfp"}

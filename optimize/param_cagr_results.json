@@ -1,4 +1,5 @@
 {
+  "status": "promoted",
   "objective": "in-market annualized CAGR (kelly-sized)",
   "basket": [
     "NVDA",
