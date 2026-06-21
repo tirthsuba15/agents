@@ -1,3 +1,4 @@
+import concurrent.futures
 import json
 import time
 import uuid
@@ -22,9 +23,9 @@ def _source_id(prefix: str) -> str:
     return f"{prefix}:{_now_iso()}:{uuid.uuid4()}"
 
 
-def _request(method: str, path: str, json_body: dict = None) -> dict:
+def _request(method: str, path: str, json_body: dict = None, timeout: int = 30) -> dict:
     url = f"{HYDRA_DB_BASE_URL}{path}"
-    resp = requests.request(method, url, headers=HEADERS, json=json_body, timeout=30)
+    resp = requests.request(method, url, headers=HEADERS, json=json_body, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 
@@ -214,58 +215,71 @@ def update_trade_order_id(trade_id: str, order_id: str) -> None:
     _add_memory(json.dumps(trade), trade_id, trade.get("ticker", "trade"))
 
 
+RAG_MAX_SCAN = 300
+
+
+def _fetch_trade_with_retry(tid: str, retries: int = 2, req_timeout: int = 15) -> dict | None:
+    for attempt in range(retries + 1):
+        try:
+            data = _request("POST", "/fetch/content", {
+                "tenant_id": HYDRA_DB_TENANT_ID,
+                "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
+                "source_id": tid,
+                "mode": "content",
+            }, timeout=req_timeout)
+            if data.get("content"):
+                return json.loads(data["content"])
+        except Exception:
+            if attempt < retries:
+                time.sleep(0.5 * (attempt + 1))
+    return None
+
+
 def query_similar_setups(embedding_vector, top_k=5) -> list[dict]:
     items = _list_all_ids()
     trade_ids = [m["memory_id"] for m in items if m.get("memory_id", "").startswith("trade:")]
+    trade_ids.sort(reverse=True)
+    trade_ids = trade_ids[:RAG_MAX_SCAN]
 
     query = np.asarray(embedding_vector, dtype=np.float64)
     scored = []
 
-    for tid in trade_ids:
-        data = _request("POST", "/fetch/content", {
-            "tenant_id": HYDRA_DB_TENANT_ID,
-            "sub_tenant_id": HYDRA_DB_SUB_TENANT_ID,
-            "source_id": tid,
-            "mode": "content",
-        })
-        if not data.get("content"):
-            continue
-        try:
-            rec = json.loads(data["content"])
-        except (json.JSONDecodeError, TypeError):
-            continue
+    def _score(tid: str):
+        rec = _fetch_trade_with_retry(tid)
+        if rec is None:
+            return None
         outcome = rec.get("outcome")
         stored_emb = rec.get("embedding")
         if outcome is None or not isinstance(stored_emb, list):
-            continue
+            return None
         vec = np.asarray(stored_emb, dtype=np.float64)
-        if vec.ndim != 1 or query.ndim != 1:
-            continue
-        if vec.shape[0] != query.shape[0]:
-            continue
+        if vec.ndim != 1 or query.ndim != 1 or vec.shape[0] != query.shape[0]:
+            return None
         norm_q = np.linalg.norm(query)
         norm_v = np.linalg.norm(vec)
         if norm_q == 0.0 or norm_v == 0.0:
-            continue
-        similarity = float(np.dot(query, vec) / (norm_q * norm_v))
-        scored.append((similarity, rec, tid))
+            return None
+        sim = float(np.dot(query, vec) / (norm_q * norm_v))
+        return (sim, rec, tid)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        for result in pool.map(_score, trade_ids):
+            if result is not None:
+                scored.append(result)
 
     scored.sort(key=lambda x: x[0], reverse=True)
     scored = scored[:top_k]
 
-    results = []
-    for sim, rec, tid in scored:
-        results.append({
-            "id": rec.get("id"),
-            "ticker": rec.get("ticker"),
-            "regime": rec.get("regime"),
-            "signals_json": rec.get("signals_json"),
-            "weights_json": rec.get("weights_json"),
-            "pnl_bps": rec.get("pnl_bps"),
-            "outcome": rec.get("outcome"),
-            "similarity": sim,
-        })
-    return results
+    return [{
+        "id": rec.get("id"),
+        "ticker": rec.get("ticker"),
+        "regime": rec.get("regime"),
+        "signals_json": rec.get("signals_json"),
+        "weights_json": rec.get("weights_json"),
+        "pnl_bps": rec.get("pnl_bps"),
+        "outcome": rec.get("outcome"),
+        "similarity": sim,
+    } for sim, rec, _ in scored]
 
 
 if __name__ == "__main__":
