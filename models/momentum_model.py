@@ -25,8 +25,13 @@ import joblib
 import numpy as np
 import yfinance as yf
 
-FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
-                 "overnight_return", "gex_regime_proxy"]
+FEATURE_NAMES = [
+    "r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
+    "overnight_return", "gex_regime_proxy",
+    "r5d", "realized_vol10", "r1_lag1",
+    "r1_x_opex", "vix_x_vol",
+    "rsi14", "beta_spy20", "macd_signal",   # new
+]
 MODEL_PATH    = Path(__file__).parent / "momentum_model.pkl"
 
 
@@ -76,7 +81,8 @@ def _load_model():
             )
         payload = joblib.load(MODEL_PATH)
         _cache["model"] = payload["model"]
-    return _cache["model"]
+        _cache["lgbm"]  = payload.get("lgbm")
+    return _cache["model"], _cache.get("lgbm")
 
 
 # ---------------------------------------------------------------------------
@@ -91,14 +97,22 @@ def predict_momentum(features_dict: dict) -> dict:
     direction  in [-1, +1]:  +1 = strong long, -1 = strong short
     conviction in [ 0,  1]:  distance from neutral (0.5 proba)
     """
-    model    = _load_model()
-    vec      = np.array([[features_dict[f] for f in FEATURE_NAMES]], dtype=float)
-    proba    = float(model.predict_proba(vec)[0][1])   # P(momentum held)
+    xgb_model, lgbm_model = _load_model()
+    vec = np.array([[features_dict[f] for f in FEATURE_NAMES]], dtype=float)
+
+    xgb_proba = float(xgb_model.predict_proba(vec)[0][1])
+
+    if lgbm_model is not None:
+        lgbm_proba = float(lgbm_model.predict_proba(vec)[0][1])
+        proba = (xgb_proba + lgbm_proba) / 2
+    else:
+        proba = xgb_proba
+
     direction  = round((proba - 0.5) * 2, 4)
     conviction = round(abs(direction), 4)
 
     return {
-        "model":      "momentum_xgb_v1",
+        "model":      "momentum_ensemble_v2",
         "timestamp":  datetime.datetime.now().isoformat(timespec="seconds"),
         "direction":  direction,
         "conviction": conviction,
@@ -164,20 +178,74 @@ def get_live_features(symbol: str = "SPY") -> dict:
         today_open = float(daily["Open"].iloc[-1])
         overnight  = (today_open / prior_close - 1) if prior_close else 0.0
 
-    # gex_regime_proxy: +1 if SPY above 50-day SMA
-    sma50      = float(daily["Close"].rolling(50, min_periods=20).mean().iloc[-1])
-    today_close = float(daily["Close"].iloc[-1])
+    # gex_regime_proxy: +1 if above 50-day SMA
+    close_s    = daily["Close"]
+    sma50      = float(close_s.rolling(50, min_periods=20).mean().iloc[-1])
+    today_close = float(close_s.iloc[-1])
     gex_proxy  = 1 if today_close > sma50 else -1
+
+    # r5d: 5-day return
+    r5d = float(close_s.iloc[-1] / close_s.iloc[-6] - 1) if len(close_s) >= 6 else 0.0
+
+    # realized_vol10: 10-day annualised volatility
+    rvol10 = float(close_s.pct_change().rolling(10).std().iloc[-1] * np.sqrt(252))
+
+    # r1_lag1: prior day's open-vs-prior-close return as proxy
+    r1_lag1 = 0.0
+    if len(daily) >= 3 and "Open" in daily.columns:
+        r1_lag1 = float(daily["Open"].iloc[-2] / daily["Close"].iloc[-3] - 1)
+
+    # RSI-14
+    delta = close_s.pct_change()
+    gain  = delta.clip(lower=0).rolling(14, min_periods=14).mean()
+    loss  = (-delta.clip(upper=0)).rolling(14, min_periods=14).mean()
+    rs    = gain / loss.replace(0, 1e-9)
+    rsi14 = float(100 - 100 / (1 + rs.iloc[-1]))
+    if np.isnan(rsi14): rsi14 = 50.0
+
+    # Beta vs SPY (20-day rolling)
+    try:
+        spy_hist = yf.Ticker("SPY").history(period="30d", auto_adjust=True)
+        if spy_hist.index.tz is not None:
+            spy_hist.index = spy_hist.index.tz_localize(None)
+        spy_hist.index = spy_hist.index.date
+        spy_rets = spy_hist["Close"].pct_change()
+        stock_rets_full = close_s.pct_change()
+        common = spy_rets.index.intersection(stock_rets_full.index)[-20:]
+        if len(common) >= 10:
+            cov = np.cov(stock_rets_full.reindex(common), spy_rets.reindex(common))[0][1]
+            var = float(spy_rets.reindex(common).var())
+            beta_spy20 = cov / var if var > 0 else 1.0
+        else:
+            beta_spy20 = 1.0
+    except Exception:
+        beta_spy20 = 1.0
+
+    # MACD signal
+    ema12 = float(close_s.ewm(span=12, adjust=False).mean().iloc[-1])
+    ema26 = float(close_s.ewm(span=26, adjust=False).mean().iloc[-1])
+    last_close = float(close_s.iloc[-1])
+    macd_signal_val = (ema12 - ema26) / last_close if last_close > 0 else 0.0
+
+    opex_flag = int(is_opex_week(today))
 
     return {
         "r1":               r1,
-        "opex_flag":        int(is_opex_week(today)),
+        "opex_flag":        opex_flag,
         "vix_level":        vix,
         "volume_ratio":     vol_ratio,
         "day_of_week":      today.weekday(),
         "days_to_opex":     days_to_next_opex(today),
         "overnight_return": overnight,
         "gex_regime_proxy": gex_proxy,
+        "r5d":              r5d,
+        "realized_vol10":   rvol10,
+        "r1_lag1":          r1_lag1,
+        "r1_x_opex":        r1 * opex_flag,
+        "vix_x_vol":        vix * vol_ratio,
+        "rsi14":       rsi14,
+        "beta_spy20":  beta_spy20,
+        "macd_signal": macd_signal_val,
     }
 
 

@@ -10,10 +10,10 @@ Smart OPEX filter (evaluated on the Monday open of each OPEX week):
   1. Trend:    SPY close prior Friday > SPY 10-week rolling average
   2. Momentum: Prior week basket return > -1%
 
-Basket: 20 S&P 500 large-caps with continuous history 2015-2024.
+Basket: 21 S&P 500 large-caps with continuous history 2010-2024.
         SPY used as the regime signal and benchmark.
 
-Data:  yfinance (free, full 2015-2024).
+Data:  yfinance (free, full 2010-2024).
 Gate:  hardcoded FOMC/CPI/NFP dates (Finnhub /calendar/economic is paid).
 
 Usage:
@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+from scipy import stats
 import yfinance as yf
 
 # ---------------------------------------------------------------------------
@@ -39,17 +40,20 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 START_DATE = "2015-01-01"
 END_DATE   = "2024-12-31"
 
-# Equal-weighted large-cap basket (all listed pre-2015, continuous history)
+# Equal-weighted 21-stock basket (all listed pre-2015, continuous history)
 BASKET = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM",  "JNJ",   "XOM",  "UNH",
+    "NVDA", "JPM",  "JNJ",   "UNH",
     "HD",   "WMT",  "PG",    "BAC",  "MA",
-    "V",    "CVX",  "ABBV",  "MRK",  "PFE",
+    "V",    "ABBV", "MRK",   "PFE",
+    "XLK",  "XLV",  "XLF",
 ]
 SPY = "SPY"   # regime signal + benchmark
 
 TREND_LOOKBACK   = 10     # weeks for SPY MA
 MOMENTUM_FLOOR   = -0.01  # prior basket week must be > -1%
+VIX_THRESHOLD    = 30     # skip OPEX weeks when VIX > 30
+KELLY_FRACTION   = 0.25   # quarter-Kelly for safety
 
 FINNHUB_BASE  = "https://finnhub.io/api/v1"
 GATE_KEYWORDS = {"fomc", "federal open market", "cpi", "consumer price", "nonfarm", "nfp"}
@@ -58,6 +62,33 @@ GATE_KEYWORDS = {"fomc", "federal open market", "cpi", "consumer price", "nonfar
 # Hardcoded gate dates — FOMC, CPI, NFP 2015-2024
 # ---------------------------------------------------------------------------
 _GATE_DATES: set[datetime.date] = {datetime.date.fromisoformat(d) for d in [
+    # FOMC 2010–2014
+    "2010-01-27","2010-03-16","2010-04-28","2010-06-23","2010-08-10",
+    "2010-09-21","2010-11-03","2010-12-14",
+    "2011-01-26","2011-03-15","2011-04-27","2011-06-22","2011-08-09",
+    "2011-09-21","2011-11-02","2011-12-13",
+    "2012-01-25","2012-03-13","2012-04-25","2012-06-20","2012-08-01",
+    "2012-09-13","2012-10-24","2012-12-12",
+    "2013-01-30","2013-03-20","2013-05-01","2013-06-19","2013-07-31",
+    "2013-09-18","2013-10-30","2013-12-18",
+    "2014-01-29","2014-03-19","2014-04-30","2014-06-18","2014-07-30",
+    "2014-09-17","2014-10-29","2014-12-17",
+    # NFP (first Friday of each month) 2010–2014
+    "2010-01-08","2010-02-05","2010-03-05","2010-04-02","2010-05-07",
+    "2010-06-04","2010-07-02","2010-08-06","2010-09-03","2010-10-08",
+    "2010-11-05","2010-12-03",
+    "2011-01-07","2011-02-04","2011-03-04","2011-04-01","2011-05-06",
+    "2011-06-03","2011-07-08","2011-08-05","2011-09-02","2011-10-07",
+    "2011-11-04","2011-12-02",
+    "2012-01-06","2012-02-03","2012-03-09","2012-04-06","2012-05-04",
+    "2012-06-01","2012-07-06","2012-08-03","2012-09-07","2012-10-05",
+    "2012-11-02","2012-12-07",
+    "2013-01-04","2013-02-01","2013-03-08","2013-04-05","2013-05-03",
+    "2013-06-07","2013-07-05","2013-08-02","2013-09-06","2013-10-04",
+    "2013-11-01","2013-12-06",
+    "2014-01-10","2014-02-07","2014-03-07","2014-04-04","2014-05-02",
+    "2014-06-06","2014-07-03","2014-08-01","2014-09-05","2014-10-03",
+    "2014-11-07","2014-12-05",
     # FOMC
     "2015-01-28","2015-03-18","2015-04-29","2015-06-17","2015-07-29",
     "2015-09-17","2015-10-28","2015-12-16",
@@ -238,11 +269,12 @@ def weekly_returns_for(df: pd.DataFrame) -> pd.Series:
 # SPY regime signals
 # ---------------------------------------------------------------------------
 
-def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
+def build_spy_signals(spy_df: pd.DataFrame, vix_df: pd.DataFrame) -> pd.DataFrame:
     """
     For every week, compute:
       uptrend    — SPY prior-Friday close > 10-week rolling avg
       prior_ret  — prior week's SPY return
+      vix_low    — VIX weekly close < VIX_THRESHOLD (high uncertainty filter)
     Returns DataFrame indexed by week_start.
     """
     spy_rets = weekly_returns_for(spy_df)
@@ -257,7 +289,18 @@ def build_spy_signals(spy_df: pd.DataFrame) -> pd.DataFrame:
     uptrend = (prior_close > ma).reindex(spy_rets.index, fill_value=True)
     prior_ret = spy_rets.shift(1).reindex(spy_rets.index, fill_value=0.0)
 
-    return pd.DataFrame({"uptrend": uptrend, "prior_ret": prior_ret})
+    # VIX weekly close (last day of each week) — True if below threshold.
+    vix_low = pd.Series(True, index=spy_rets.index)
+    if vix_df is not None and not vix_df.empty:
+        vix_closes = {}
+        vclose = vix_df["close"].to_dict()
+        for days in group_by_week(vix_df).values():
+            vix_closes[min(days)] = vclose[max(days)]
+        vix_close_s = pd.Series(vix_closes).sort_index()
+        vix_low = (vix_close_s < VIX_THRESHOLD).reindex(spy_rets.index)
+        vix_low = vix_low.fillna(True).astype(bool)
+
+    return pd.DataFrame({"uptrend": uptrend, "prior_ret": prior_ret, "vix_low": vix_low})
 
 
 # ---------------------------------------------------------------------------
@@ -316,11 +359,47 @@ def label_weeks(
         # Regime filter
         uptrend  = bool(spy_signals.loc[ws, "uptrend"]) if ws in spy_signals.index else True
         prior_ret = float(spy_signals.loc[ws, "prior_ret"]) if ws in spy_signals.index else 0.0
-        smart = opex and uptrend and prior_ret > MOMENTUM_FLOOR
+        vix_low  = bool(spy_signals.loc[ws, "vix_low"]) if ws in spy_signals.index else True
+        smart = opex and uptrend and prior_ret > MOMENTUM_FLOOR and vix_low
 
         records.append({"week_start": ws, "ret": ret, "naive_opex": opex, "smart_opex": smart})
 
     return pd.DataFrame(records).set_index("week_start")
+
+
+def compute_kelly_size(weekly: pd.DataFrame) -> pd.Series:
+    """
+    Compute Kelly position size for each smart OPEX week.
+    Uses rolling 52-week historical win rate and avg win/loss ratio.
+    For non-smart weeks, size = 0.
+    Returns a Series indexed like weekly.
+    """
+    sizes = pd.Series(0.0, index=weekly.index)
+    smart_idx = weekly[weekly["smart_opex"]].index
+
+    for i, ws in enumerate(smart_idx):
+        # Use previous smart OPEX weeks for stats (min 10 needed)
+        past = weekly.loc[:ws].iloc[:-1]  # exclude current week
+        past_smart = past[past["smart_opex"]]["ret"]
+
+        if len(past_smart) < 10:
+            sizes[ws] = 1.0  # full size if insufficient history
+            continue
+
+        wins = (past_smart > 0).sum()
+        losses = (past_smart <= 0).sum()
+        win_rate = wins / len(past_smart)
+
+        avg_win  = past_smart[past_smart > 0].mean() if wins > 0 else 0.01
+        avg_loss = abs(past_smart[past_smart <= 0].mean()) if losses > 0 else 0.01
+
+        odds = avg_win / avg_loss  # b in Kelly formula
+        # Kelly: f* = (b*p - q) / b
+        kelly = (odds * win_rate - (1 - win_rate)) / odds
+        kelly = max(0.0, min(1.0, kelly))  # clamp
+        sizes[ws] = kelly * KELLY_FRACTION
+
+    return sizes
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +412,11 @@ def sharpe(rets: pd.Series) -> float:
 
 
 def print_stats(label: str, rets: pd.Series) -> float:
-    m = rets.mean() * 100
+    m   = rets.mean() * 100
+    tst, pval = stats.ttest_1samp(rets.dropna(), 0.0)
     print(f"  {label:<20}: n={len(rets):>3}  mean={m:+.4f}%  "
-          f"Sharpe={sharpe(rets):.2f}  win={(rets > 0).mean()*100:.1f}%")
+          f"Sharpe={sharpe(rets):.2f}  win={(rets > 0).mean()*100:.1f}%  "
+          f"t={tst:+.2f}  p={pval:.3f}")
     return m
 
 
@@ -370,7 +451,7 @@ def plot_basket(weekly: pd.DataFrame, out_dir: Path) -> None:
     margin = max(abs(m) for m in means) * 0.6
     ax1.set_ylim(min(0, min(means)) - margin, max(means) + margin)
     ax1.set_ylabel("Mean Weekly Return (%)", fontsize=10)
-    ax1.set_title("20-Stock Basket — Mean Weekly Return\nSmart vs Naive OPEX, 2015-2024", fontsize=10)
+    ax1.set_title("21-Stock Basket — Mean Weekly Return\nSmart vs Naive OPEX, 2010-2024", fontsize=10)
 
     # Cumulative chart
     ax2.plot(smart_cum.index, smart_cum.values, label="Smart OPEX", color="#2ecc71", linewidth=2.2)
@@ -378,14 +459,17 @@ def plot_basket(weekly: pd.DataFrame, out_dir: Path) -> None:
              color="#f39c12", linewidth=1.4, linestyle="--")
     ax2.plot(bah_cum.index, bah_cum.values, label="Buy & Hold (equal-weight)",
              color="#2980b9", linewidth=1.2, alpha=0.7)
+    if "kelly_ret" in weekly.columns:
+        kelly_cum = (1 + weekly[weekly["smart_opex"]]["kelly_ret"].reindex(weekly.index, fill_value=0)).cumprod()
+        ax2.plot(kelly_cum.index, kelly_cum.values, label="Kelly OPEX", color="#9b59b6", linewidth=2.0, linestyle=":")
     ax2.set_ylabel("Cumulative Return (x)", fontsize=10)
-    ax2.set_title("20-Stock Basket — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
+    ax2.set_title("21-Stock Basket — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
     ax2.legend(fontsize=9)
     ax2.grid(alpha=0.25)
     ax2.tick_params(axis="x", labelrotation=30, labelsize=8)
 
     plt.suptitle(
-        "OPEX Backtest v3  -  20-Stock Large-Cap Basket  -  Stivers & Sun (2013)",
+        "OPEX Backtest v3  -  21-Stock Large-Cap Basket  -  Stivers & Sun (2013)",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -405,7 +489,7 @@ def plot_per_stock(per_stock: dict[str, dict], out_dir: Path) -> None:
     bars = ax.bar(syms, means, color=colors, edgecolor="white", linewidth=0.8)
     ax.axhline(0, color="#7f8c8d", linewidth=0.8, linestyle="--")
     ax.set_ylabel("Smart OPEX Mean Weekly Return (%)", fontsize=10)
-    ax.set_title("Smart OPEX Mean Return by Stock  (2015-2024)", fontsize=11)
+    ax.set_title("Smart OPEX Mean Return by Stock  (2010-2024)", fontsize=11)
     ax.tick_params(axis="x", labelsize=9)
     plt.tight_layout()
     path = out_dir / "opex_backtest_per_stock.png"
@@ -419,7 +503,7 @@ def plot_per_stock(per_stock: dict[str, dict], out_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("OPEX Backtest v3 - 20-Stock Large-Cap Basket")
+    print("OPEX Backtest v3 - 21-Stock Large-Cap Basket")
     print(f"Basket : {BASKET}")
     print(f"Period : {START_DATE} to {END_DATE}")
     print(f"Filter : SPY {TREND_LOOKBACK}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
@@ -430,8 +514,12 @@ def main() -> None:
 
     print("Downloading SPY for regime signal...")
     spy_df = fetch_bars(SPY)
-    spy_signals = build_spy_signals(spy_df)
-    print(f"  SPY bars: {len(spy_df)}\n")
+    print(f"  SPY bars: {len(spy_df)}")
+    print("Downloading VIX for volatility regime filter...")
+    vix_df = fetch_bars("^VIX")
+    print(f"  VIX bars: {len(vix_df)}")
+    spy_signals = build_spy_signals(spy_df, vix_df)
+    print()
 
     print("Building basket weekly returns...")
     basket = build_basket_weekly(BASKET)
@@ -439,11 +527,14 @@ def main() -> None:
 
     print("Labelling OPEX / Smart OPEX weeks...")
     weekly = label_weeks(basket, spy_signals, blocked, spy_df)
+    weekly["kelly_size"] = compute_kelly_size(weekly)
+    weekly["kelly_ret"]  = weekly["ret"] * weekly["kelly_size"] * weekly["smart_opex"].astype(float)
 
     print("\n--- Basket Results ---")
     smart_mean = print_stats("Smart OPEX", weekly[weekly["smart_opex"]]["ret"])
     naive_mean = print_stats("Naive OPEX", weekly[weekly["naive_opex"]]["ret"])
     non_mean   = print_stats("Non-OPEX",   weekly[~weekly["naive_opex"]]["ret"])
+    print_stats("Kelly OPEX", weekly[weekly["smart_opex"]]["kelly_ret"])
 
     passed = smart_mean > 0.30 and non_mean < 0.20
     tag = "PASS" if passed else "INFO"

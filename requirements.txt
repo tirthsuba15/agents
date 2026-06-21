@@ -1,3 +1,6 @@
+# API sidecar (dashboard backend)
+fastapi
+uvicorn[standard]
 # Person B (memory/RAG)
 requests
 numpy
@@ -15,4 +18,5 @@ joblib
 pandas
 scipy
 yfinance
+lightgbm
 matplotlib
