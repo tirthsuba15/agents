@@ -25,8 +25,12 @@ import joblib
 import numpy as np
 import yfinance as yf
 
-FEATURE_NAMES = ["r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
-                 "overnight_return", "gex_regime_proxy"]
+FEATURE_NAMES = [
+    "r1", "opex_flag", "vix_level", "volume_ratio", "day_of_week", "days_to_opex",
+    "overnight_return", "gex_regime_proxy",
+    "r5d", "realized_vol10", "r1_lag1",
+    "r1_x_opex", "vix_x_vol",
+]
 MODEL_PATH    = Path(__file__).parent / "momentum_model.pkl"
 
 
@@ -164,20 +168,39 @@ def get_live_features(symbol: str = "SPY") -> dict:
         today_open = float(daily["Open"].iloc[-1])
         overnight  = (today_open / prior_close - 1) if prior_close else 0.0
 
-    # gex_regime_proxy: +1 if SPY above 50-day SMA
-    sma50      = float(daily["Close"].rolling(50, min_periods=20).mean().iloc[-1])
-    today_close = float(daily["Close"].iloc[-1])
+    # gex_regime_proxy: +1 if above 50-day SMA
+    close_s    = daily["Close"]
+    sma50      = float(close_s.rolling(50, min_periods=20).mean().iloc[-1])
+    today_close = float(close_s.iloc[-1])
     gex_proxy  = 1 if today_close > sma50 else -1
+
+    # r5d: 5-day return
+    r5d = float(close_s.iloc[-1] / close_s.iloc[-6] - 1) if len(close_s) >= 6 else 0.0
+
+    # realized_vol10: 10-day annualised volatility
+    rvol10 = float(close_s.pct_change().rolling(10).std().iloc[-1] * np.sqrt(252))
+
+    # r1_lag1: prior day's open-vs-prior-close return as proxy
+    r1_lag1 = 0.0
+    if len(daily) >= 3 and "Open" in daily.columns:
+        r1_lag1 = float(daily["Open"].iloc[-2] / daily["Close"].iloc[-3] - 1)
+
+    opex_flag = int(is_opex_week(today))
 
     return {
         "r1":               r1,
-        "opex_flag":        int(is_opex_week(today)),
+        "opex_flag":        opex_flag,
         "vix_level":        vix,
         "volume_ratio":     vol_ratio,
         "day_of_week":      today.weekday(),
         "days_to_opex":     days_to_next_opex(today),
         "overnight_return": overnight,
         "gex_regime_proxy": gex_proxy,
+        "r5d":              r5d,
+        "realized_vol10":   rvol10,
+        "r1_lag1":          r1_lag1,
+        "r1_x_opex":        r1 * opex_flag,
+        "vix_x_vol":        vix * vol_ratio,
     }
 
 

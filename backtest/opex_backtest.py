@@ -10,10 +10,10 @@ Smart OPEX filter (evaluated on the Monday open of each OPEX week):
   1. Trend:    SPY close prior Friday > SPY 10-week rolling average
   2. Momentum: Prior week basket return > -1%
 
-Basket: 20 S&P 500 large-caps with continuous history 2015-2024.
+Basket: 21 S&P 500 large-caps with continuous history 2010-2024.
         SPY used as the regime signal and benchmark.
 
-Data:  yfinance (free, full 2015-2024).
+Data:  yfinance (free, full 2010-2024).
 Gate:  hardcoded FOMC/CPI/NFP dates (Finnhub /calendar/economic is paid).
 
 Usage:
@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+from scipy import stats
 import yfinance as yf
 
 # ---------------------------------------------------------------------------
@@ -39,12 +40,13 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 START_DATE = "2015-01-01"
 END_DATE   = "2024-12-31"
 
-# Equal-weighted large-cap basket (all listed pre-2015, continuous history)
+# Equal-weighted 21-stock basket (all listed pre-2015, continuous history)
 BASKET = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "JPM",  "JNJ",   "XOM",  "UNH",
+    "NVDA", "JPM",  "JNJ",   "UNH",
     "HD",   "WMT",  "PG",    "BAC",  "MA",
-    "V",    "CVX",  "ABBV",  "MRK",  "PFE",
+    "V",    "ABBV", "MRK",   "PFE",
+    "XLK",  "XLV",  "XLF",
 ]
 SPY = "SPY"   # regime signal + benchmark
 
@@ -58,6 +60,33 @@ GATE_KEYWORDS = {"fomc", "federal open market", "cpi", "consumer price", "nonfar
 # Hardcoded gate dates — FOMC, CPI, NFP 2015-2024
 # ---------------------------------------------------------------------------
 _GATE_DATES: set[datetime.date] = {datetime.date.fromisoformat(d) for d in [
+    # FOMC 2010–2014
+    "2010-01-27","2010-03-16","2010-04-28","2010-06-23","2010-08-10",
+    "2010-09-21","2010-11-03","2010-12-14",
+    "2011-01-26","2011-03-15","2011-04-27","2011-06-22","2011-08-09",
+    "2011-09-21","2011-11-02","2011-12-13",
+    "2012-01-25","2012-03-13","2012-04-25","2012-06-20","2012-08-01",
+    "2012-09-13","2012-10-24","2012-12-12",
+    "2013-01-30","2013-03-20","2013-05-01","2013-06-19","2013-07-31",
+    "2013-09-18","2013-10-30","2013-12-18",
+    "2014-01-29","2014-03-19","2014-04-30","2014-06-18","2014-07-30",
+    "2014-09-17","2014-10-29","2014-12-17",
+    # NFP (first Friday of each month) 2010–2014
+    "2010-01-08","2010-02-05","2010-03-05","2010-04-02","2010-05-07",
+    "2010-06-04","2010-07-02","2010-08-06","2010-09-03","2010-10-08",
+    "2010-11-05","2010-12-03",
+    "2011-01-07","2011-02-04","2011-03-04","2011-04-01","2011-05-06",
+    "2011-06-03","2011-07-08","2011-08-05","2011-09-02","2011-10-07",
+    "2011-11-04","2011-12-02",
+    "2012-01-06","2012-02-03","2012-03-09","2012-04-06","2012-05-04",
+    "2012-06-01","2012-07-06","2012-08-03","2012-09-07","2012-10-05",
+    "2012-11-02","2012-12-07",
+    "2013-01-04","2013-02-01","2013-03-08","2013-04-05","2013-05-03",
+    "2013-06-07","2013-07-05","2013-08-02","2013-09-06","2013-10-04",
+    "2013-11-01","2013-12-06",
+    "2014-01-10","2014-02-07","2014-03-07","2014-04-04","2014-05-02",
+    "2014-06-06","2014-07-03","2014-08-01","2014-09-05","2014-10-03",
+    "2014-11-07","2014-12-05",
     # FOMC
     "2015-01-28","2015-03-18","2015-04-29","2015-06-17","2015-07-29",
     "2015-09-17","2015-10-28","2015-12-16",
@@ -333,9 +362,11 @@ def sharpe(rets: pd.Series) -> float:
 
 
 def print_stats(label: str, rets: pd.Series) -> float:
-    m = rets.mean() * 100
+    m   = rets.mean() * 100
+    tst, pval = stats.ttest_1samp(rets.dropna(), 0.0)
     print(f"  {label:<20}: n={len(rets):>3}  mean={m:+.4f}%  "
-          f"Sharpe={sharpe(rets):.2f}  win={(rets > 0).mean()*100:.1f}%")
+          f"Sharpe={sharpe(rets):.2f}  win={(rets > 0).mean()*100:.1f}%  "
+          f"t={tst:+.2f}  p={pval:.3f}")
     return m
 
 
@@ -370,7 +401,7 @@ def plot_basket(weekly: pd.DataFrame, out_dir: Path) -> None:
     margin = max(abs(m) for m in means) * 0.6
     ax1.set_ylim(min(0, min(means)) - margin, max(means) + margin)
     ax1.set_ylabel("Mean Weekly Return (%)", fontsize=10)
-    ax1.set_title("20-Stock Basket — Mean Weekly Return\nSmart vs Naive OPEX, 2015-2024", fontsize=10)
+    ax1.set_title("21-Stock Basket — Mean Weekly Return\nSmart vs Naive OPEX, 2010-2024", fontsize=10)
 
     # Cumulative chart
     ax2.plot(smart_cum.index, smart_cum.values, label="Smart OPEX", color="#2ecc71", linewidth=2.2)
@@ -379,13 +410,13 @@ def plot_basket(weekly: pd.DataFrame, out_dir: Path) -> None:
     ax2.plot(bah_cum.index, bah_cum.values, label="Buy & Hold (equal-weight)",
              color="#2980b9", linewidth=1.2, alpha=0.7)
     ax2.set_ylabel("Cumulative Return (x)", fontsize=10)
-    ax2.set_title("20-Stock Basket — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
+    ax2.set_title("21-Stock Basket — Cumulative Return\nSmart OPEX vs Naive vs Buy & Hold", fontsize=10)
     ax2.legend(fontsize=9)
     ax2.grid(alpha=0.25)
     ax2.tick_params(axis="x", labelrotation=30, labelsize=8)
 
     plt.suptitle(
-        "OPEX Backtest v3  -  20-Stock Large-Cap Basket  -  Stivers & Sun (2013)",
+        "OPEX Backtest v3  -  21-Stock Large-Cap Basket  -  Stivers & Sun (2013)",
         fontsize=12, fontweight="bold",
     )
     plt.tight_layout()
@@ -405,7 +436,7 @@ def plot_per_stock(per_stock: dict[str, dict], out_dir: Path) -> None:
     bars = ax.bar(syms, means, color=colors, edgecolor="white", linewidth=0.8)
     ax.axhline(0, color="#7f8c8d", linewidth=0.8, linestyle="--")
     ax.set_ylabel("Smart OPEX Mean Weekly Return (%)", fontsize=10)
-    ax.set_title("Smart OPEX Mean Return by Stock  (2015-2024)", fontsize=11)
+    ax.set_title("Smart OPEX Mean Return by Stock  (2010-2024)", fontsize=11)
     ax.tick_params(axis="x", labelsize=9)
     plt.tight_layout()
     path = out_dir / "opex_backtest_per_stock.png"
@@ -419,7 +450,7 @@ def plot_per_stock(per_stock: dict[str, dict], out_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("OPEX Backtest v3 - 20-Stock Large-Cap Basket")
+    print("OPEX Backtest v3 - 21-Stock Large-Cap Basket")
     print(f"Basket : {BASKET}")
     print(f"Period : {START_DATE} to {END_DATE}")
     print(f"Filter : SPY {TREND_LOOKBACK}-week MA trend + prior week > {MOMENTUM_FLOOR*100:.0f}%\n")
